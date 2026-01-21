@@ -188,7 +188,10 @@ def _calculate_irb_foundation_corporate(ead: float, pd: float, lgd: float, matur
     K_adj = K_unadj * maturity_adjustment
 
     # Regulatory scaling to RWA: RWA = 12.5 * K_adj * EAD
-    rwa = 12.5 * K_adj * ead
+    SCALING_FACTOR_IRB = 1.06  # Basel IRB scaling factor
+
+    rwa = 12.5 * SCALING_FACTOR_IRB * K_adj * ead
+
 
     # capital required using the user-supplied capital ratio
     capital_required = rwa * capital_ratio
