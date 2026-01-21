@@ -154,19 +154,21 @@ if exposure_choice == "Loans":
     if st.button("Calculate loan capital"):
         ead = compute_ead(commitment_amount, balance, loan_type, utilization_pct)
         result = calculate_loan_capital(
-            approach=approach,
-            ead=ead,
-            balance=balance,
-            maturity_months=maturity_months,
-            amortization_months=amortization_months,
-            interest_rate=interest_rate,
-            pd=pd_input,
-            lgd=lgd_input,
-            exposure_type=exposure_type,
-            rating_bucket=rating_bucket,
-            is_regulatory_retail=is_regulatory_retail,
-            is_prudent_mortgage=is_prudent_mortgage,
-        )
+        approach=approach,
+        ead=ead,
+        balance=balance,
+        maturity_months=maturity_months,
+        amortization_months=amortization_months,
+        interest_rate=interest_rate,
+        pd=pd_input,
+        lgd=lgd_input,
+        exposure_type=exposure_type,
+        rating_bucket=rating_bucket,
+        is_regulatory_retail=is_regulatory_retail,
+        is_prudent_mortgage=is_prudent_mortgage,
+        capital_ratio=capital_ratio,   # NEW
+    )
+
 
         st.write("### Results")
         st.write(f"Exposure at Default (EAD): {format_currency(ead)}")

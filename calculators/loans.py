@@ -18,9 +18,6 @@ IRB:
   from the Basel II IRB risk-weight paper and Basel III constraints. :contentReference[oaicite:3]{index=3}
 """
 
-BASE_CAPITAL_RATIO = 0.08  # target capital ratio (8% of RWA by default)
-
-
 def calculate_loan_capital(
     approach: str,
     ead: float,
@@ -34,7 +31,9 @@ def calculate_loan_capital(
     rating_bucket: str,
     is_regulatory_retail: bool = False,
     is_prudent_mortgage: bool = False,
+    capital_ratio: float = 0.08,
 ):
+
     """
     Main entrypoint for loan capital.
     - For standardized approaches: compute risk weight from exposure type + rating bucket.
@@ -69,7 +68,8 @@ def calculate_loan_capital(
             rw = 1.0
 
         rwa = ead * rw
-        capital = rwa * BASE_CAPITAL_RATIO
+        capital = rwa * capital_ratio
+
 
         return {
             "approach": approach,
@@ -81,7 +81,7 @@ def calculate_loan_capital(
             "EAD": ead,
             "RWA": rwa,
             "capital_required": capital,
-            "capital_ratio": BASE_CAPITAL_RATIO,
+            "capital_ratio": capital_ratio,   # NEW
             "notes": (
                 "Standardized approach using simplified risk-weight mapping. "
                 "Refine with full Basel tables for production use."
@@ -98,7 +98,9 @@ def calculate_loan_capital(
             maturity_months=maturity_months,
             pd=pd,
             lgd=lgd,
+            capital_ratio=capital_ratio,
         )
+
 
     # =========================
     # FALLBACK
