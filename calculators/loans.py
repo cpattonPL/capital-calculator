@@ -1,23 +1,39 @@
+# calculators/loans.py
+import math
+from math import log, sqrt
+from scipy.stats import norm
+
 """
 Loan calculation module.
 
-Each approach function returns a dict with:
-- 'RWA' (risk-weighted assets)
-- 'capital_required' (e.g., 8% of RWA or other regulatory %)
-- intermediate items used (pd/lgd/effective_risk_weight/etc)
+This file contains:
+- Standardized approach (simplified)
+- IRB Foundation for corporate exposures (Basel II-style)
+- IRB fallback for non-corporates (still a stub)
 
-Standardised approach:
-- Implements a *simplified* Basel II standardized mapping for key exposure types
-  (sovereign/central bank, bank, corporate, retail, residential mortgages, etc.). :contentReference[oaicite:1]{index=1}
-- Implements a *simplified* Basel III standardized mapping (e.g., investment-grade corporates
-  with lower weights, but without the full LTV/leverage grids). :contentReference[oaicite:2]{index=2}
-  You should refine these with the exact tables from BCBS128 and d424.
-
-IRB:
-- Still a stub that demonstrates the structure; replace with the IRB risk-weight functions
-  from the Basel II IRB risk-weight paper and Basel III constraints. :contentReference[oaicite:3]{index=3}
+References / implementation notes:
+- IRB corporate formulas (correlation, b(PD), K formula, maturity adjustment) follow the Basel II IRB explanatory note.
+  Key formula (conceptual):
+    K = LGD * N[ (1-R)^(-1/2) * G(PD) + (R/(1-R))^(1/2) * G(0.999) ] - PD * LGD
+    K_adj = K * (1 + (M - 2.5) * b(PD)) / (1 - 1.5 * b(PD))
+    RWA = 12.5 * K_adj * EAD
+  where:
+    - G is the inverse normal CDF (norm.ppf)
+    - N is the normal CDF (norm.cdf)
+    - R = supervisory correlation function of PD
+    - b(PD) = (0.11852 - 0.05478 * ln(PD))^2
+- Default supervisory LGD for Foundation IRB is 45% if user does not provide an LGD.
+- The code must be validated and calibrated against your national regulator's implementation and supervisory parameters.
 """
 
+# ---------------------------
+# Top-level defaults
+# ---------------------------
+# Note: capital_ratio is now passed in from the UI (do not hardcode here)
+
+# ---------------------------
+# Public entrypoint
+# ---------------------------
 def calculate_loan_capital(
     approach: str,
     ead: float,
@@ -33,19 +49,9 @@ def calculate_loan_capital(
     is_prudent_mortgage: bool = False,
     capital_ratio: float = 0.08,
 ):
-
-    """
-    Main entrypoint for loan capital.
-    - For standardized approaches: compute risk weight from exposure type + rating bucket.
-    - For IRB approaches: use PD/LGD stub function (to be replaced with proper IRB formula).
-
-    Returns a dict with RWA and capital plus some diagnostics.
-    """
     approach_lower = approach.lower()
 
-    # =========================
-    # STANDARDIZED APPROACHES
-    # =========================
+    # STANDARDIZED
     if "standardized" in approach_lower or "standardised" in approach_lower:
         if "basel ii" in approach_lower:
             version = "Basel II"
@@ -70,7 +76,6 @@ def calculate_loan_capital(
         rwa = ead * rw
         capital = rwa * capital_ratio
 
-
         return {
             "approach": approach,
             "version": version,
@@ -81,36 +86,170 @@ def calculate_loan_capital(
             "EAD": ead,
             "RWA": rwa,
             "capital_required": capital,
-            "capital_ratio": capital_ratio,   # NEW
+            "capital_ratio": capital_ratio,
             "notes": (
                 "Standardized approach using simplified risk-weight mapping. "
                 "Refine with full Basel tables for production use."
             ),
         }
 
-    # =========================
-    # IRB APPROACHES (STUB)
-    # =========================
+    # IRB approaches
     elif "irb" in approach_lower:
-        return _calculate_irb_stub(
-            approach=approach,
-            ead=ead,
-            maturity_months=maturity_months,
-            pd=pd,
-            lgd=lgd,
-            capital_ratio=capital_ratio,
-        )
-
-
-    # =========================
-    # FALLBACK
-    # =========================
+        # If exposure is corporate, use IRB Foundation corporate implementation
+        if exposure_type and "corporate" in exposure_type.lower():
+            return _calculate_irb_foundation_corporate(
+                ead=ead,
+                pd=pd,
+                lgd=lgd,
+                maturity_months=maturity_months,
+                capital_ratio=capital_ratio,
+                approach=approach,
+            )
+        else:
+            # Non-corporate IRB not yet implemented — fallback stub
+            return _calculate_irb_stub(
+                approach=approach,
+                ead=ead,
+                maturity_months=maturity_months,
+                pd=pd,
+                lgd=lgd,
+                capital_ratio=capital_ratio,
+            )
     else:
         return {"error": f"Unknown approach: {approach}"}
 
 
 # -------------------------------------------------------------------
-# Basel II Standardized — simplified risk weights
+# IRB Foundation: corporate exposures (Basel II-style)
+# -------------------------------------------------------------------
+def _calculate_irb_foundation_corporate(ead: float, pd: float, lgd: float, maturity_months: int, capital_ratio: float, approach: str):
+    """
+    Foundation IRB corporate capital calculation.
+
+    Inputs:
+    - ead: exposure at default (currency)
+    - pd: probability of default (decimal, e.g., 0.01)
+    - lgd: loss given default (decimal). For Foundation IRB, if not provided, we default to 45% (0.45).
+    - maturity_months: effective maturity in months (convert to years for formula)
+    - capital_ratio: user-supplied capital ratio to compute final capital required
+
+    Returns a dict with K, RWA, capital and diagnostics.
+    """
+
+    # Defaults & sanitation
+    pd = float(pd) if (pd is not None and pd > 0.0) else 0.01  # default PD = 1% if missing or zero
+    lgd = float(lgd) if (lgd is not None and lgd > 0.0) else 0.45  # default LGD = 45% for Foundation IRB
+    M = float(maturity_months) / 12.0 if maturity_months and maturity_months > 0 else 3.0  # default M = 3 years
+
+    # Supervisory correlation function R(PD) — Basel II corporate formula
+    # R = 0.12 * (1 - exp(-50 * PD)) / (1 - exp(-50)) + 0.24 * (1 - (1 - exp(-50 * PD)) / (1 - exp(-50)))
+    # This is algebraically equal to:
+    # R = 0.12*(1 - exp(-50*PD))/(1 - exp(-50)) + 0.24*(1 - (1 - exp(-50*PD))/(1 - exp(-50)))
+    exp_term = math.exp(-50.0 * pd)
+    denom = 1.0 - math.exp(-50.0)
+    # protect against edge-case denom = 0 (it isn't, but defensive coding)
+    if denom == 0:
+        denom = 1e-12
+    R = 0.12 * (1.0 - exp_term) / denom + 0.24 * (1.0 - (1.0 - exp_term) / denom)
+
+    # b(PD) maturity adjustment parameter
+    # b(PD) = (0.11852 - 0.05478 * ln(PD))^2
+    # ensure pd not zero to avoid log(0)
+    pd_for_b = max(pd, 1e-9)
+    b = (0.11852 - 0.05478 * math.log(pd_for_b)) ** 2
+
+    # Compute the ASRF term:
+    # term = (1 - R)^(-1/2) * G(PD) + (R / (1 - R))^(1/2) * G(0.999)
+    inv_norm_pd = norm.ppf(pd)      # G(PD)
+    inv_norm_999 = norm.ppf(0.999)  # G(0.999)
+    term = (inv_norm_pd / math.sqrt(1.0 - R)) + (math.sqrt(R / (1.0 - R)) * inv_norm_999)
+
+    # K (unadjusted)
+    K_unadj = lgd * norm.cdf(term) - pd * lgd
+
+    # Maturity adjustment factor
+    # K_adj = K_unadj * (1 + (M - 2.5) * b) / (1 - 1.5 * b)
+    denom_ma = (1.0 - 1.5 * b)
+    if denom_ma <= 0:
+        # if denominator non-positive, clip to small positive to avoid division by zero / nonsensical growth
+        denom_ma = 1e-9
+    maturity_adjustment = (1.0 + (M - 2.5) * b) / denom_ma
+
+    K_adj = K_unadj * maturity_adjustment
+
+    # Regulatory scaling to RWA: RWA = 12.5 * K_adj * EAD
+    rwa = 12.5 * K_adj * ead
+
+    # capital required using the user-supplied capital ratio
+    capital_required = rwa * capital_ratio
+
+    result = {
+        "approach": approach,
+        "irb_treatment": "Foundation - Corporate",
+        "pd_used": pd,
+        "lgd_used": lgd,
+        "maturity_years": M,
+        "supervisory_correlation_R": R,
+        "b_pd": b,
+        "K_unadjusted": K_unadj,
+        "maturity_adjustment_factor": maturity_adjustment,
+        "K_adjusted": K_adj,
+        "EAD": ead,
+        "RWA": rwa,
+        "capital_ratio": capital_ratio,
+        "capital_required": capital_required,
+        "notes": (
+            "IRB Foundation corporate calculation implemented. Defaults: PD=1% if missing, LGD=45% if missing, M=3y if missing."
+            " Validate against regulatory worked examples and your jurisdiction's supervisory parameters."
+        ),
+    }
+
+    return result
+
+
+# -------------------------------------------------------------------
+# IRB fallback stub for non-corporates (keeps previous behavior)
+# -------------------------------------------------------------------
+def _calculate_irb_stub(
+    approach: str,
+    ead: float,
+    maturity_months: int,
+    pd: float,
+    lgd: float,
+    capital_ratio: float,
+):
+    """
+    Very rough IRB placeholder for non-corporates — DO NOT USE FOR REAL CAPITAL CALCULATION.
+    Kept for continuity for asset classes we haven't implemented yet.
+    """
+    pd = pd if pd and pd > 0 else 0.01
+    lgd = lgd if lgd and lgd > 0 else 0.45
+
+    base_rw = pd * (lgd * 12) + (maturity_months / 120.0)
+    risk_weight = min(5.0, max(0.5, base_rw))  # between 50% and 500%
+
+    rwa = ead * risk_weight
+    capital = rwa * capital_ratio
+
+    return {
+        "approach": approach,
+        "pd_used": pd,
+        "lgd_used": lgd,
+        "risk_weight": risk_weight,
+        "risk_weight_pct": f"{risk_weight * 100:.1f}%",
+        "EAD": ead,
+        "RWA": rwa,
+        "capital_required": capital,
+        "capital_ratio": capital_ratio,
+        "notes": (
+            "IRB calculation is a placeholder for non-corporate exposures. Implement "
+            "the official IRB risk-weight formulas for each asset class before use."
+        ),
+    }
+
+
+# -------------------------------------------------------------------
+# Standardized (unchanged simplified helpers below)
 # -------------------------------------------------------------------
 def get_standardized_risk_weight_basel2(
     exposure_type: str,
@@ -118,22 +257,9 @@ def get_standardized_risk_weight_basel2(
     is_regulatory_retail: bool,
     is_prudent_mortgage: bool,
 ) -> float:
-    """
-    Simplified Basel II standardized risk weights (illustrative).
-
-    Key ideas:
-    - Claims on corporates: 20/50/100/150% based on external rating, 100% for unrated. :contentReference[oaicite:4]{index=4}
-    - Retail claims: 75% if qualifying retail; otherwise 100%. :contentReference[oaicite:5]{index=5}
-    - Residential mortgages: 35% for prudently underwritten exposures, otherwise 100%. :contentReference[oaicite:6]{index=6}
-    - Sovereigns and banks: rating-based buckets (simplified).
-    - Other assets: 100%.
-
-    Returns a decimal risk weight (e.g., 1.0 = 100%).
-    """
     exposure_type = exposure_type.lower()
     rating_bucket = rating_bucket.lower()
 
-    # Helper: rating-based RW mapping for corporates (Basel II-style)
     corporate_rw_by_rating = {
         "aaa to aa-": 0.20,
         "a+ to a-": 0.50,
@@ -143,7 +269,6 @@ def get_standardized_risk_weight_basel2(
         "unrated": 1.00,
     }
 
-    # Sovereign / central bank — simplified Basel II table
     sovereign_rw_by_rating = {
         "aaa to aa-": 0.00,
         "a+ to a-": 0.20,
@@ -153,7 +278,6 @@ def get_standardized_risk_weight_basel2(
         "unrated": 1.00,
     }
 
-    # Banks — simplified rating-based mapping
     bank_rw_by_rating = {
         "aaa to aa-": 0.20,
         "a+ to a-": 0.50,
@@ -179,42 +303,26 @@ def get_standardized_risk_weight_basel2(
         return 0.35 if is_prudent_mortgage else 1.00
 
     if "commercial" in exposure_type and "real estate" in exposure_type:
-        return 1.00  # 100% RW for commercial real estate (simplified)
+        return 1.00
 
-    # Other assets default to 100% RW
     return 1.00
 
 
-# -------------------------------------------------------------------
-# Basel III Standardized — simplified risk weights
-# -------------------------------------------------------------------
 def get_standardized_risk_weight_basel3(
     exposure_type: str,
     rating_bucket: str,
     is_regulatory_retail: bool,
     is_prudent_mortgage: bool,
 ) -> float:
-    """
-    Simplified Basel III standardized risk weights.
-
-    This is deliberately a *light* implementation:
-    - Corporates: treat "Investment Grade" (AAA–BBB-) as 75%, others 100%, unrated 100%. :contentReference[oaicite:7]{index=7}
-    - Retail: 75% (regulatory retail) or 100% (other).
-    - Residential mortgages: 35% for qualifying exposures, otherwise 100%.
-      (Real Basel III uses LTV + income-producing distinctions.)
-    - Sovereigns and banks: reuse Basel II tables for now (to be refined).
-    """
     exposure_type = exposure_type.lower()
     rating_bucket = rating_bucket.lower()
 
-    # Simple notion of "investment grade": AAA to BBB-
     investment_grade_buckets = {
         "aaa to aa-",
         "a+ to a-",
         "bbb+ to bbb-",
     }
 
-    # For simplicity, reuse Basel II sovereign/bank tables
     if "sovereign" in exposure_type or "central bank" in exposure_type:
         return get_standardized_risk_weight_basel2(
             exposure_type="Sovereign / Central Bank",
@@ -233,9 +341,9 @@ def get_standardized_risk_weight_basel3(
 
     if "corporate" in exposure_type:
         if rating_bucket in investment_grade_buckets:
-            return 0.75  # simplified investment-grade corporate RW
+            return 0.75
         else:
-            return 1.00  # all other corporates (including unrated)
+            return 1.00
 
     if "retail" in exposure_type:
         return 0.75 if is_regulatory_retail else 1.00
@@ -244,56 +352,6 @@ def get_standardized_risk_weight_basel3(
         return 0.35 if is_prudent_mortgage else 1.00
 
     if "commercial" in exposure_type and "real estate" in exposure_type:
-        # Basel III actually uses LTV-based buckets; keep 100% as a placeholder
         return 1.00
 
     return 1.00
-
-
-# -------------------------------------------------------------------
-# IRB stub (unchanged structural idea, but slightly cleaned)
-# -------------------------------------------------------------------
-def _calculate_irb_stub(
-    approach: str,
-    ead: float,
-    maturity_months: int,
-    pd: float,
-    lgd: float,
-):
-    """
-    Very rough IRB placeholder — DO NOT USE FOR REAL CAPITAL CALCULATION.
-
-    Replace with:
-    - Basel II IRB risk-weight functions (corporate, sovereign, bank, etc.). :contentReference[oaicite:8]{index=8}
-    - Basel III constraints/parameter floors.
-
-    For now, we:
-    - Default PD to 1% and LGD to 45% if omitted.
-    - Scale a pseudo "risk weight" based on PD, LGD and maturity.
-    """
-    approach_lower = approach.lower()
-    pd = pd if pd and pd > 0 else 0.01
-    lgd = lgd if lgd and lgd > 0 else 0.45
-
-    # Completely arbitrary placeholder; bounded to avoid absurd numbers
-    base_rw = pd * (lgd * 12) + (maturity_months / 120.0)
-    risk_weight = min(5.0, max(0.5, base_rw))  # between 50% and 500%
-
-    rwa = ead * risk_weight
-    capital = rwa * BASE_CAPITAL_RATIO
-
-    return {
-        "approach": approach,
-        "pd_used": pd,
-        "lgd_used": lgd,
-        "risk_weight": risk_weight,
-        "risk_weight_pct": f"{risk_weight * 100:.1f}%",
-        "EAD": ead,
-        "RWA": rwa,
-        "capital_required": capital,
-        "capital_ratio": BASE_CAPITAL_RATIO,
-        "notes": (
-            "IRB calculation is a placeholder. Implement the official IRB risk-weight "
-            "formulas (Basel II/III) before using for any real decisions."
-        ),
-    }
