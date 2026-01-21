@@ -79,6 +79,23 @@ if exposure_choice == "Loans":
     )
 
     st.markdown("---")
+    st.subheader("Capital settings")
+
+    capital_ratio = st.number_input(
+        "Capital Ratio (e.g. 0.08 = 8%)",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.08,
+        step=0.005,
+        help=(
+            "Target capital ratio applied to RWA. "
+            "Basel minimum total capital is typically 8%, "
+            "but banks often use higher internal targets."
+        ),
+    )
+
+
+    st.markdown("---")
     st.subheader("Standardized exposure classification")
 
     # NEW: standardized exposure type (Basel asset class)
