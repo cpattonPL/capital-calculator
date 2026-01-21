@@ -139,7 +139,17 @@ def _calculate_irb_foundation_corporate(ead: float, pd: float, lgd: float, matur
     # Defaults & sanitation
     pd = float(pd) if (pd is not None and pd > 0.0) else 0.01  # default PD = 1% if missing or zero
     lgd = float(lgd) if (lgd is not None and lgd > 0.0) else 0.45  # default LGD = 45% for Foundation IRB
-    M = float(maturity_months) / 12.0 if maturity_months and maturity_months > 0 else 3.0  # default M = 3 years
+    # Effective maturity (M) based on the facility maturity term (years),
+    # subject to Basel floor/cap when measuring M.
+    # Basel notes Foundation IRB often uses fixed M=2.5y, but you requested
+    # maturity-term-based M for this implementation. :contentReference[oaicite:2]{index=2}
+    if maturity_months and maturity_months > 0:
+        M_raw = float(maturity_months) / 12.0
+        M = min(5.0, max(1.0, M_raw))  # floor 1 year, cap 5 years
+    else:
+        # If maturity is missing, fall back to the Basel Foundation default 2.5 years.
+        M = 2.5  # :contentReference[oaicite:3]{index=3}
+
 
     # Supervisory correlation function R(PD) — Basel II corporate formula
     # R = 0.12 * (1 - exp(-50 * PD)) / (1 - exp(-50)) + 0.24 * (1 - (1 - exp(-50 * PD)) / (1 - exp(-50)))
