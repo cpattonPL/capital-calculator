@@ -7,12 +7,15 @@ Contains:
 - IRB Foundation (Corporate, Bank, Sovereign/Central Bank) — ASRF implementation
 - IRB fallback stub for other exposure types (until implemented)
 
-Notes:
-- IRB Foundation implementation uses the Basel IRB ASRF/Vasicek structure with 99.9th percentile,
-  maturity adjustment, and IRB scaling factor 1.06.
-- Effective maturity M is derived from the loan's maturity term (months) with Basel-style floor/cap:
-  floor 1 year, cap 5 years; fallback 2.5 years if missing.
-- Foundation IRB uses supervisory LGD by default (0.45) if user doesn't provide LGD.
+Important IRB mechanics included:
+- ASRF / Vasicek structure with 99.9% quantile
+- Maturity adjustment
+- IRB scaling factor 1.06
+- PD floors by asset class (Basel III-style defaults)
+
+Input normalization:
+- PD and LGD can be provided as decimals (0.01) or percentages (1 = 1%).
+  We normalize: values > 1 are interpreted as percentages and divided by 100.
 
 Dependencies:
 - scipy (for norm.cdf / norm.ppf)
@@ -24,7 +27,17 @@ from scipy.stats import norm
 # Basel IRB scaling factor
 SCALING_FACTOR_IRB = 1.06
 
+# Basel III-style PD floors (defaults; jurisdiction may vary)
+PD_FLOORS = {
+    "corporate": 0.0003,   # 0.03%
+    "bank": 0.0005,        # 0.05%
+    "sovereign": 0.0005,   # 0.05%
+}
 
+
+# ---------------------------
+# Public entrypoint
+# ---------------------------
 def calculate_loan_capital(
     approach: str,
     ead: float,
@@ -48,6 +61,7 @@ def calculate_loan_capital(
 
     IRB:
       - Implements Foundation IRB for Corporate, Bank, Sovereign/Central Bank using ASRF.
+      - Applies PD floors by asset class (defaults in PD_FLOORS).
       - Other exposure types fall back to a stub (until implemented).
     """
     approach_lower = (approach or "").lower()
@@ -146,7 +160,7 @@ def calculate_loan_capital(
 
 
 # -------------------------------------------------------------------
-# IRB Foundation wrappers (Step 3 refactor: corporate uses shared helper)
+# IRB Foundation wrappers (Corporate/Bank/Sovereign use shared helper)
 # -------------------------------------------------------------------
 def _calculate_irb_foundation_corporate(
     ead: float,
@@ -157,7 +171,8 @@ def _calculate_irb_foundation_corporate(
     approach: str,
 ):
     return _calculate_irb_foundation_asrf(
-        asset_class="Foundation - Corporate",
+        asset_class_key="corporate",
+        asset_class_label="Foundation - Corporate",
         ead=ead,
         pd=pd,
         lgd=lgd,
@@ -176,7 +191,8 @@ def _calculate_irb_foundation_bank(
     approach: str,
 ):
     return _calculate_irb_foundation_asrf(
-        asset_class="Foundation - Bank",
+        asset_class_key="bank",
+        asset_class_label="Foundation - Bank",
         ead=ead,
         pd=pd,
         lgd=lgd,
@@ -195,7 +211,8 @@ def _calculate_irb_foundation_sovereign(
     approach: str,
 ):
     return _calculate_irb_foundation_asrf(
-        asset_class="Foundation - Sovereign/Central Bank",
+        asset_class_key="sovereign",
+        asset_class_label="Foundation - Sovereign/Central Bank",
         ead=ead,
         pd=pd,
         lgd=lgd,
@@ -205,8 +222,12 @@ def _calculate_irb_foundation_sovereign(
     )
 
 
+# -------------------------------------------------------------------
+# Shared IRB ASRF implementation + PD floors
+# -------------------------------------------------------------------
 def _calculate_irb_foundation_asrf(
-    asset_class: str,
+    asset_class_key: str,
+    asset_class_label: str,
     ead: float,
     pd: float,
     lgd: float,
@@ -217,22 +238,18 @@ def _calculate_irb_foundation_asrf(
     """
     Shared ASRF implementation for Foundation IRB (Corporate/Bank/Sovereign).
 
-    Steps:
-      1) Sanitize inputs, default PD and supervisory LGD where missing.
-      2) Determine effective maturity M from maturity_months with floor/cap (1 to 5 years).
-      3) Compute supervisory correlation R(PD).
-      4) Compute b(PD) maturity factor.
-      5) Compute unadjusted K via Vasicek/ASRF at 99.9%.
-      6) Apply maturity adjustment to K.
-      7) Convert to RWA with 12.5 * 1.06 * K_adj * EAD.
-      8) Apply user-supplied capital_ratio to compute capital_required.
+    Adds:
+      - PD floor by asset class (PD_FLOORS) applied after input normalization.
     """
-    # Defaults & sanitation
-    pd_used = float(pd) if (pd is not None and pd > 0.0) else 0.01
-    # Foundation IRB supervisory LGD default (common baseline): 45%
-    lgd_used = float(lgd) if (lgd is not None and lgd > 0.0) else 0.45
+    # ---- Normalize inputs (support decimal or % entry)
+    pd_in = _normalize_rate(pd, default=0.01)   # default PD 1% if missing
+    lgd_in = _normalize_rate(lgd, default=0.45) # supervisory LGD default 45% if missing
 
-    # Effective maturity M based on loan maturity term (years), floor 1, cap 5; fallback 2.5
+    # ---- Apply PD floor by asset class (Basel III-style defaults)
+    pd_floor = PD_FLOORS.get(asset_class_key, 0.0003)  # fallback to corporate floor if unknown
+    pd_used = max(pd_in, pd_floor)
+
+    # ---- Effective maturity M based on loan maturity term (years), floor 1, cap 5; fallback 2.5
     if maturity_months and maturity_months > 0:
         M_raw = float(maturity_months) / 12.0
         M = min(5.0, max(1.0, M_raw))
@@ -240,42 +257,47 @@ def _calculate_irb_foundation_asrf(
         M_raw = None
         M = 2.5
 
-    # Supervisory correlation function R(PD) for corporate/bank/sovereign style exposures
+    # ---- Supervisory correlation function R(PD) for corporate/bank/sovereign style exposures
+    # Note: A production-grade engine may vary correlation or impose floors by asset class;
+    # here we use the common Basel II functional form and differentiate primarily via PD floors.
     exp_term = math.exp(-50.0 * pd_used)
     denom = 1.0 - math.exp(-50.0)
     denom = denom if denom != 0 else 1e-12
     R = 0.12 * (1.0 - exp_term) / denom + 0.24 * (1.0 - (1.0 - exp_term) / denom)
 
-    # b(PD) maturity adjustment parameter
+    # ---- b(PD) maturity adjustment parameter
     pd_for_b = max(pd_used, 1e-9)
     b = (0.11852 - 0.05478 * math.log(pd_for_b)) ** 2
 
-    # ASRF term at 99.9%
+    # ---- ASRF term at 99.9%
     inv_norm_pd = norm.ppf(pd_used)
     inv_norm_999 = norm.ppf(0.999)
     term = (inv_norm_pd / math.sqrt(1.0 - R)) + (math.sqrt(R / (1.0 - R)) * inv_norm_999)
 
-    # K (unadjusted)
-    K_unadj = lgd_used * norm.cdf(term) - pd_used * lgd_used
+    # ---- K (unadjusted)
+    K_unadj = lgd_in * norm.cdf(term) - pd_used * lgd_in
 
-    # Maturity adjustment
+    # ---- Maturity adjustment
     denom_ma = (1.0 - 1.5 * b)
     denom_ma = denom_ma if denom_ma > 0 else 1e-9
     maturity_adjustment = (1.0 + (M - 2.5) * b) / denom_ma
     K_adj = K_unadj * maturity_adjustment
 
-    # RWA conversion with scaling factor
+    # ---- RWA conversion with scaling factor
     rwa = 12.5 * SCALING_FACTOR_IRB * K_adj * ead
     capital_required = rwa * capital_ratio
 
-    # Handy derived "risk weight" for display: RW = RWA / EAD
+    # ---- Derived effective risk weight: RWA / EAD
     rw_effective = (rwa / ead) if ead and ead > 0 else None
 
     return {
         "approach": approach,
-        "irb_treatment": asset_class,
+        "irb_treatment": asset_class_label,
+        "pd_input_normalized": pd_in,
+        "pd_floor_applied": pd_floor,
         "pd_used": pd_used,
-        "lgd_used": lgd_used,
+        "lgd_input_normalized": lgd_in,
+        "lgd_used": lgd_in,
         "maturity_years": M,
         "maturity_years_raw": M_raw,
         "supervisory_correlation_R": R,
@@ -292,9 +314,33 @@ def _calculate_irb_foundation_asrf(
         "capital_required": capital_required,
         "notes": (
             "Foundation IRB ASRF implementation for corporate/bank/sovereign-style exposures. "
-            "Includes maturity adjustment and IRB scaling factor 1.06."
+            "Includes maturity adjustment, IRB scaling factor 1.06, and PD floors by asset class."
         ),
     }
+
+
+def _normalize_rate(x, default: float) -> float:
+    """
+    Normalize a rate that might be supplied as:
+      - decimal (0.01)
+      - percent (1 meaning 1%, or 45 meaning 45%)
+    Rules:
+      - if x is None or <= 0: return default
+      - if x > 1: treat as percent and divide by 100
+      - else: treat as decimal
+    """
+    if x is None:
+        return float(default)
+    try:
+        val = float(x)
+    except (TypeError, ValueError):
+        return float(default)
+
+    if val <= 0.0:
+        return float(default)
+    if val > 1.0:
+        return val / 100.0
+    return val
 
 
 # -------------------------------------------------------------------
@@ -311,8 +357,8 @@ def _calculate_irb_stub(
     """
     Placeholder for IRB asset classes not yet implemented.
     """
-    pd_used = float(pd) if (pd is not None and pd > 0.0) else 0.01
-    lgd_used = float(lgd) if (lgd is not None and lgd > 0.0) else 0.45
+    pd_used = _normalize_rate(pd, default=0.01)
+    lgd_used = _normalize_rate(lgd, default=0.45)
     m = float(maturity_months) if (maturity_months and maturity_months > 0) else 36.0
 
     # Arbitrary placeholder, bounded
