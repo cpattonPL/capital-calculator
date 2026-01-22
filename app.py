@@ -5,6 +5,7 @@ import numpy as np
 from calculators.common import compute_ead, format_currency
 from calculators.loans import calculate_loan_capital
 from calculators.securitizations import calculate_securitization_capital
+from calculators.constants import RatingBucket
 
 st.set_page_config(page_title="Capital Calculator", layout="wide")
 
@@ -115,14 +116,8 @@ if exposure_choice == "Loans":
     # NEW: rating bucket used by standardized approach (if relevant)
     rating_bucket = st.selectbox(
         "External rating bucket (if applicable)",
-        [
-            "Unrated",
-            "AAA to AA-",
-            "A+ to A-",
-            "BBB+ to BBB-",
-            "BB+ to B-",
-            "Below B-",
-        ],
+        options=list(RatingBucket),
+        format_func=lambda rb: rb.label,
         help="Used for rating-based risk weights (sovereigns, banks, corporates).",
     )
 
