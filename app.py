@@ -23,6 +23,16 @@ def _pct(x: float) -> str:
         return str(x)
 
 
+COLLATERAL_OPTIONS = [
+    ("Unsecured / None", None),
+    ("Financial collateral", "financial"),
+    ("Receivables", "receivables"),
+    ("Real estate collateral", "real_estate"),
+    ("Other physical collateral", "other_physical"),
+    ("Intangibles", "intangibles"),
+]
+
+
 with st.sidebar:
     st.header("Approach & Exposure")
 
@@ -56,7 +66,7 @@ with st.sidebar:
         "Jurisdiction",
         options=["US", "CAN"],
         index=0,
-        help="CAN applies OSFI/Basel III-final input floors. US default applies none, but BCBS baseline can be optionally enabled.",
+        help="CAN applies OSFI/Basel III-final input floors. US default applies none; BCBS baseline can be optionally enabled.",
     )
 
     apply_bcbs_baseline_floors = st.checkbox(
@@ -146,8 +156,29 @@ with col3:
         value=0.45,
         step=0.01,
         format="%.4f",
-        help="Decimal form (0.45 = 45%). For Basel III IRB Advanced, this is treated as bank-estimated LGD and may be floored depending on jurisdiction/settings.",
+        help="Decimal form (0.45 = 45%). For Basel III IRB Advanced, treated as bank-estimated LGD and may be floored depending on jurisdiction/settings.",
     )
+
+# Collateral type is ALWAYS a loan input (for future EAD/mitigation + for A-IRB floors when enabled)
+st.subheader("Credit Risk Mitigation Inputs (future EAD/mitigation, and A-IRB floors when enabled)")
+c1, c2 = st.columns([2, 3])
+
+with c1:
+    label_to_value = {lbl: val for (lbl, val) in COLLATERAL_OPTIONS}
+    selected_label = st.selectbox(
+        "Collateral type",
+        options=[lbl for (lbl, _) in COLLATERAL_OPTIONS],
+        index=0,
+        help="Always captured as a loan input. Used today for Basel III IRB Advanced LGD secured-floor selection when floors are enabled, and later for mitigation/EAD work.",
+    )
+    collateral_type = label_to_value[selected_label]
+
+with c2:
+    floors_enabled = (jurisdiction == "CAN") or (jurisdiction == "US" and apply_bcbs_baseline_floors)
+    if approach == Approach.BASEL_III_IRB_ADVANCED and floors_enabled:
+        st.caption("LGD floors are enabled for this run; collateral type will affect the secured LGD floor.")
+    else:
+        st.caption("Collateral type is stored but not currently applied (it will be used later for mitigation/EAD work).")
 
 # Derived balance & EAD (simple prototype)
 if loan_type == "Term":
@@ -235,6 +266,7 @@ if st.button("Run Calculation", type="primary"):
         capital_ratio=float(capital_ratio),
         jurisdiction=jurisdiction,
         apply_bcbs_baseline_floors=bool(apply_bcbs_baseline_floors),
+        collateral_type=collateral_type,  # ALWAYS passed
         property_value=property_value,
         property_income_dependent=bool(property_income_dependent),
         counterparty_type=counterparty_type,
@@ -296,6 +328,8 @@ if st.button("Run Calculation", type="primary"):
             st.write(result.get("pd_note"))
 
         with l2:
+            st.write("**Collateral type (loan input)**")
+            st.write(result.get("collateral_type"))
             st.write("**LGD mode**")
             st.write(result.get("lgd_mode"))
             st.write("**LGD used**")
