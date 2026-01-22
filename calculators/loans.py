@@ -1,17 +1,12 @@
 # calculators/loans.py
 """
-Loan calculation module.
+Loan calculation module with Basel III A-IRB LGD input floors & audit outputs.
 
-Implements:
-- Basel II Standardized (simplified)
-- Basel III Standardized (Corporates, Banks, CRE) + CRE audit/debug details
-- Basel II IRB (Foundation) prototype (no output floor)
-- Basel III IRB (Foundation) + Output Floor
-- Basel III IRB (Advanced) + Output Floor
-
-Important:
-- We are intentionally deferring a more accurate Basel EAD/CCF function.
-- CRE continues to use EAD for LTV (so later EAD improvements won’t break CRE wiring).
+Key changes:
+- Adds LGD_FLOORS_BASEL3, applied only when Approach == BASEL_III_IRB_ADVANCED and
+  lgd_mode == "bank_estimated".
+- Emits lgd_floor_applied, lgd_floor_value, lgd_note in IRB outputs for auditability.
+- Leaves existing CRE details and output floor behavior intact.
 """
 
 import math
@@ -59,6 +54,17 @@ LGD_DEFAULTS_BASEL3_FIRB = {
     "corporate": 0.40,
     "bank": 0.45,
     "sovereign": 0.45,
+}
+
+# ----------------------------
+# Basel III A-IRB LGD floors (input constraints for bank-estimated LGD)
+# Prototype values — replace with your jurisdiction's supervisory floors as required.
+# These floors are only applied when A-IRB is selected and LGD is bank-estimated.
+# ----------------------------
+LGD_FLOORS_BASEL3 = {
+    "corporate": 0.10,   # 10% minimum LGD for corporate exposures (example prototype)
+    "bank": 0.05,        # 5% minimum LGD for bank exposures (example prototype)
+    "sovereign": 0.02,   # 2% minimum LGD for sovereign exposures (example prototype)
 }
 
 
@@ -189,13 +195,15 @@ def calculate_loan_capital(
             if approach_enum == Approach.BASEL_III_IRB_ADVANCED:
                 irb_mode = "Basel III IRB - Advanced"
                 lgd_mode = "bank_estimated"
-                lgd_defaults = LGD_DEFAULTS_BASEL3_FIRB  # used only if input missing
+                lgd_defaults = LGD_DEFAULTS_BASEL3_FIRB
+                # A-IRB: also apply LGD floors for bank-estimated LGD
+                lgd_floors = LGD_FLOORS_BASEL3
             else:
                 # Foundation (also covers BASEL_III_IRB alias)
                 irb_mode = "Basel III IRB - Foundation"
                 lgd_mode = "supervisory"
                 lgd_defaults = LGD_DEFAULTS_BASEL3_FIRB
-
+                lgd_floors = {}  # no bank-estimated LGD floors applied for F-IRB
         else:
             # Basel II IRB Foundation (existing prototype)
             pd_floors = PD_FLOORS_BASEL2
@@ -203,6 +211,7 @@ def calculate_loan_capital(
             irb_mode = "Basel II IRB - Foundation"
             lgd_mode = "supervisory"
             lgd_defaults = LGD_DEFAULTS_BASEL2_FIRB
+            lgd_floors = {}
 
         irb_result = _calculate_irb_asrf(
             asset_class_key=asset_class_key,
@@ -218,6 +227,7 @@ def calculate_loan_capital(
             scaling_factor=scaling_factor,
             irb_mode=irb_mode,
             lgd_mode=lgd_mode,
+            lgd_floors=lgd_floors,
         )
 
         # Basel II IRB returns directly (no output floor)
@@ -450,6 +460,7 @@ def _calculate_irb_asrf(
     scaling_factor: float,
     irb_mode: str,
     lgd_mode: str,  # "supervisory" or "bank_estimated"
+    lgd_floors: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     pd_in = _normalize_rate(pd, default=0.01)
     pd_floor = pd_floors.get(asset_class_key, 0.0003)
@@ -463,14 +474,33 @@ def _calculate_irb_asrf(
 
     # LGD handling:
     # - Foundation: use supervisory LGD defaults
-    # - Advanced: use provided LGD (bank-estimated); if missing/<=0, fall back to default
+    # - Advanced: use provided LGD (bank-estimated); if missing/<=0, fall back to default AND apply LGD floor if configured
     lgd_default = lgd_defaults.get(asset_class_key, 0.45)
+
+    lgd_floor_value = None
+    lgd_floor_applied = False
+    lgd_note = None
+
     if lgd_mode == "supervisory":
         lgd_used = float(lgd_default)
         lgd_source = "supervisory_default"
+        lgd_note = f"Using supervisory default LGD={lgd_used:.4f}"
     else:
-        # bank_estimated
-        lgd_used = _normalize_rate(lgd, default=lgd_default)
+        # bank_estimated: normalize user-supplied lgd, but apply floor if configured
+        lgd_in = _normalize_rate(lgd, default=lgd_default)
+        if lgd_floors and asset_class_key in lgd_floors:
+            lgd_floor_value = float(lgd_floors[asset_class_key])
+            if lgd_in < lgd_floor_value:
+                lgd_used = lgd_floor_value
+                lgd_floor_applied = True
+                lgd_note = f"Bank-estimated LGD {lgd_in:.4f} raised to floor {lgd_floor_value:.4f}"
+            else:
+                lgd_used = lgd_in
+                lgd_note = f"Bank-estimated LGD used: {lgd_used:.4f} (no floor applied)"
+        else:
+            lgd_used = lgd_in
+            lgd_note = f"Bank-estimated LGD used: {lgd_used:.4f} (no floor configured)"
+
         lgd_source = "bank_estimated" if (lgd is not None and float(lgd) > 0) else "default_used_missing_input"
 
     # Correlation (same functional form as existing prototype)
@@ -493,7 +523,7 @@ def _calculate_irb_asrf(
     rwa = 12.5 * scaling_factor * K_adj * ead
     capital_required = rwa * capital_ratio
 
-    return {
+    result = {
         "approach_enum": approach_enum.name,
         "approach_label": approach_enum.label,
         "irb_mode": irb_mode,
@@ -504,6 +534,9 @@ def _calculate_irb_asrf(
         "lgd_used": lgd_used,
         "lgd_source": lgd_source,
         "lgd_default": lgd_default,
+        "lgd_floor_applied": lgd_floor_applied,
+        "lgd_floor_value": lgd_floor_value,
+        "lgd_note": lgd_note,
         "maturity_years": M,
         "supervisory_correlation_R": R,
         "K_unadjusted": K,
@@ -516,6 +549,8 @@ def _calculate_irb_asrf(
         "capital_ratio": capital_ratio,
         "capital_required": capital_required,
     }
+
+    return result
 
 
 def _calculate_irb_stub(

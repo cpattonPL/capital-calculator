@@ -129,7 +129,7 @@ with col3:
         value=0.45,
         step=0.01,
         format="%.4f",
-        help="Decimal form (0.45 = 45%). For Basel III IRB Advanced, this is used as bank-estimated LGD.",
+        help="Decimal form (0.45 = 45%). For Basel III IRB Advanced, this is used as bank-estimated LGD and subject to LGD floors.",
     )
 
 # Derived balance & EAD (simple prototype)
@@ -265,6 +265,25 @@ if st.button("Run Calculation", type="primary"):
 
         st.caption("Full CRE detail payload:")
         st.json(cd)
+
+    # LGD floor / details (IRB)
+    if "lgd_note" in result:
+        st.subheader("LGD details (IRB)")
+        l1, l2 = st.columns(2)
+        with l1:
+            st.write("**LGD mode**")
+            st.write(result.get("lgd_mode"))
+            st.write("**LGD used**")
+            st.write(result.get("lgd_used"))
+            st.write("**LGD source**")
+            st.write(result.get("lgd_source"))
+        with l2:
+            st.write("**LGD floor applied?**")
+            st.write(result.get("lgd_floor_applied"))
+            st.write("**LGD floor value**")
+            st.write(result.get("lgd_floor_value"))
+            st.write("**LGD note**")
+            st.write(result.get("lgd_note"))
 
     # Output floor section (Basel III IRB)
     if "output_floor" in result and isinstance(result["output_floor"], dict):
