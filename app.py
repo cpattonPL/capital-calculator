@@ -50,6 +50,23 @@ with st.sidebar:
     )
 
     st.divider()
+    st.header("Jurisdiction & Floors")
+
+    jurisdiction = st.selectbox(
+        "Jurisdiction",
+        options=["US", "CAN"],
+        index=0,
+        help="CAN applies OSFI/Basel III-final input floors. US default applies none, but BCBS baseline can be optionally enabled.",
+    )
+
+    apply_bcbs_baseline_floors = st.checkbox(
+        "Apply BCBS baseline input floors (US only)",
+        value=False,
+        help="When enabled in US, applies BCBS Basel III IRB input floors as a configurable option. Canada still uses OSFI rules.",
+        disabled=(jurisdiction != "US"),
+    )
+
+    st.divider()
     st.header("Capital Settings")
     capital_ratio = st.number_input(
         "Capital Ratio",
@@ -129,7 +146,7 @@ with col3:
         value=0.45,
         step=0.01,
         format="%.4f",
-        help="Decimal form (0.45 = 45%). For Basel III IRB Advanced, this is used as bank-estimated LGD and subject to LGD floors.",
+        help="Decimal form (0.45 = 45%). For Basel III IRB Advanced, this is treated as bank-estimated LGD and may be floored depending on jurisdiction/settings.",
     )
 
 # Derived balance & EAD (simple prototype)
@@ -216,6 +233,8 @@ if st.button("Run Calculation", type="primary"):
         is_regulatory_retail=bool(is_regulatory_retail),
         is_prudent_mortgage=bool(is_prudent_mortgage),
         capital_ratio=float(capital_ratio),
+        jurisdiction=jurisdiction,
+        apply_bcbs_baseline_floors=bool(apply_bcbs_baseline_floors),
         property_value=property_value,
         property_income_dependent=bool(property_income_dependent),
         counterparty_type=counterparty_type,
@@ -223,7 +242,7 @@ if st.button("Run Calculation", type="primary"):
 
     st.subheader("Results")
 
-    key_cols = st.columns(4)
+    key_cols = st.columns(5)
     with key_cols[0]:
         if "risk_weight_pct" in result:
             st.metric("Risk Weight", result["risk_weight_pct"])
@@ -236,10 +255,9 @@ if st.button("Run Calculation", type="primary"):
         if "capital_required" in result:
             st.metric("Capital Required", _currency(result["capital_required"]))
     with key_cols[3]:
-        if "version" in result:
-            st.metric("Version", result["version"])
-        elif "irb_mode" in result:
-            st.metric("IRB Mode", result["irb_mode"])
+        st.metric("Jurisdiction", result.get("jurisdiction", jurisdiction))
+    with key_cols[4]:
+        st.metric("Floor Regime", result.get("floor_regime", "N/A"))
 
     # CRE details section
     if "cre_details" in result and isinstance(result["cre_details"], dict):
@@ -266,24 +284,30 @@ if st.button("Run Calculation", type="primary"):
         st.caption("Full CRE detail payload:")
         st.json(cd)
 
-    # LGD floor / details (IRB)
-    if "lgd_note" in result:
-        st.subheader("LGD details (IRB)")
+    # LGD + PD details (IRB)
+    if "lgd_note" in result or "pd_note" in result:
+        st.subheader("LGD / PD details (IRB)")
+
         l1, l2 = st.columns(2)
         with l1:
+            st.write("**PD input / used**")
+            st.write({"pd_input": result.get("pd_input"), "pd_used": result.get("pd_used"), "pd_floor": result.get("pd_floor")})
+            st.write("**PD note**")
+            st.write(result.get("pd_note"))
+
+        with l2:
             st.write("**LGD mode**")
             st.write(result.get("lgd_mode"))
             st.write("**LGD used**")
             st.write(result.get("lgd_used"))
-            st.write("**LGD source**")
-            st.write(result.get("lgd_source"))
-        with l2:
             st.write("**LGD floor applied?**")
             st.write(result.get("lgd_floor_applied"))
             st.write("**LGD floor value**")
             st.write(result.get("lgd_floor_value"))
             st.write("**LGD note**")
             st.write(result.get("lgd_note"))
+            st.write("**LGD rule path**")
+            st.write(result.get("lgd_rule_path"))
 
     # Output floor section (Basel III IRB)
     if "output_floor" in result and isinstance(result["output_floor"], dict):

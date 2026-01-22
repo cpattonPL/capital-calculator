@@ -1,12 +1,11 @@
 # calculators/loans.py
 """
-Loan calculation module with Basel III A-IRB LGD input floors & audit outputs.
+Loan calculation module
 
-Key changes:
-- Adds LGD_FLOORS_BASEL3, applied only when Approach == BASEL_III_IRB_ADVANCED and
-  lgd_mode == "bank_estimated".
-- Emits lgd_floor_applied, lgd_floor_value, lgd_note in IRB outputs for auditability.
-- Leaves existing CRE details and output floor behavior intact.
+This version adds:
+- Jurisdiction-aware Basel III IRB input floors (PD and LGD) using official Basel/OSFI text.
+- Configurable "BCBS baseline floors" option for jurisdictions that have not adopted Basel III final.
+- LGD audit outputs (lgd_used + floor/rule notes) similar to CRE rule-path details.
 """
 
 import math
@@ -26,23 +25,68 @@ SCALING_FACTOR_BASEL2_IRB = 1.06
 BASEL3_OUTPUT_FLOOR_PCT = 0.725
 
 
-# ----------------------------
-# PD floors (prototype)
-# ----------------------------
-PD_FLOORS_BASEL2 = {
-    "corporate": 0.0003,  # 0.03%
-    "bank": 0.0005,       # 0.05%
-    "sovereign": 0.0005,  # 0.05%
+# ============================================================
+# Basel III / OSFI / Basel Framework input floors (official)
+# ============================================================
+
+# Basel/OSFI PD floor: 0.05% for all exposures except sovereign asset class
+# (We implement sovereign floor as 0.0 / not applied.)
+PD_FLOOR_BASEL3_GENERAL = 0.0005  # 0.05%
+
+# Retail PD minimums from Basel/OSFI text (not fully wired into UI yet)
+PD_FLOOR_RETAIL_OTHER = 0.0005      # 0.05%
+PD_FLOOR_RETAIL_QRRE_REVOLVER = 0.0010  # 0.10%
+
+
+# Basel/OSFI LGD floors for wholesale (corporate/PSE) and retail:
+# We expose these as a structured mapping so we can:
+# - Apply OSFI/Canada explicitly
+# - Apply BCBS baseline as an optional choice in US
+#
+# NOTE: These floors depend on "secured vs unsecured" and (if secured) collateral type.
+# Our current UI does not capture collateral type; we therefore apply the *unsecured floor*
+# by default for wholesale classes unless/until collateral typing is added.
+LGD_FLOORS_BASEL_WHOLESALE = {
+    "unsecured": 0.25,  # 25%
+    "secured_by_collateral_type": {
+        "financial": 0.00,
+        "receivables": 0.10,
+        "real_estate": 0.10,      # commercial or residential real estate
+        "other_physical": 0.15,
+        "intangibles": 0.25,
+    },
 }
 
-# Basel III PD floor (prototype)
-PD_FLOORS_BASEL3 = {
-    "corporate": 0.0005,  # 0.05%
-    "bank": 0.0005,       # 0.05%
-    "sovereign": 0.0005,  # 0.05%
+LGD_FLOORS_BASEL_RETAIL = {
+    "qrre": 0.50,                 # unsecured QRRE (transactors/revolvers)
+    "residential_mortgage": 0.10,  # secured residential mortgages (fixed)
+    "other_retail_unsecured": 0.30,
+    "other_retail_secured_by_collateral_type": {
+        "financial": 0.00,
+        "receivables": 0.10,
+        "real_estate": 0.10,
+        "other_physical": 0.15,
+    },
 }
 
+# Jurisdiction wrapper:
+# - CAN uses OSFI implementation (which draws from Basel Framework)
+# - US by default uses no Basel III-final input floors (but can apply BCBS baseline as an option)
+JURISDICTION = {
+    "CAN": "CAN",
+    "US": "US",
+}
+
+FLOOR_REGIME = {
+    "NONE": "NONE",
+    "BCBS": "BCBS",   # configurable option for non-adopting jurisdictions
+    "OSFI": "OSFI",   # Canada
+}
+
+
+# ----------------------------
 # Supervisory LGD defaults for F-IRB (prototype defaults)
+# ----------------------------
 LGD_DEFAULTS_BASEL2_FIRB = {
     "corporate": 0.45,
     "bank": 0.45,
@@ -54,17 +98,6 @@ LGD_DEFAULTS_BASEL3_FIRB = {
     "corporate": 0.40,
     "bank": 0.45,
     "sovereign": 0.45,
-}
-
-# ----------------------------
-# Basel III A-IRB LGD floors (input constraints for bank-estimated LGD)
-# Prototype values — replace with your jurisdiction's supervisory floors as required.
-# These floors are only applied when A-IRB is selected and LGD is bank-estimated.
-# ----------------------------
-LGD_FLOORS_BASEL3 = {
-    "corporate": 0.10,   # 10% minimum LGD for corporate exposures (example prototype)
-    "bank": 0.05,        # 5% minimum LGD for bank exposures (example prototype)
-    "sovereign": 0.02,   # 2% minimum LGD for sovereign exposures (example prototype)
 }
 
 
@@ -85,6 +118,11 @@ def calculate_loan_capital(
     is_regulatory_retail: bool = False,
     is_prudent_mortgage: bool = False,
     capital_ratio: float = 0.08,
+    # NEW:
+    jurisdiction: str = "US",                  # "US" or "CAN"
+    apply_bcbs_baseline_floors: bool = False,  # for US/non-adopting jurisdictions
+    # Optional future input (not wired in UI yet):
+    collateral_type: Optional[str] = None,     # e.g. "financial", "receivables", "real_estate", "other_physical", "intangibles"
     # CRE-specific optional parameters
     property_value: Optional[float] = None,
     property_income_dependent: bool = False,
@@ -94,6 +132,16 @@ def calculate_loan_capital(
     et_enum = _coerce_exposure_type(exposure_type)
     rb_enum = _coerce_rating_bucket(rating_bucket)
     cp_enum = _coerce_exposure_type(counterparty_type) if counterparty_type is not None else ExposureType.CORPORATE
+
+    jurisdiction_norm = (jurisdiction or "US").strip().upper()
+    if jurisdiction_norm not in (JURISDICTION["US"], JURISDICTION["CAN"]):
+        jurisdiction_norm = JURISDICTION["US"]
+
+    # Determine which floor regime to use for Basel III IRB input floors
+    if jurisdiction_norm == JURISDICTION["CAN"]:
+        floor_regime = FLOOR_REGIME["OSFI"]
+    else:
+        floor_regime = FLOOR_REGIME["BCBS"] if apply_bcbs_baseline_floors else FLOOR_REGIME["NONE"]
 
     # fallback if coercion fails
     if approach_enum is None:
@@ -189,29 +237,54 @@ def calculate_loan_capital(
 
         # Basel III IRB branching: Foundation vs Advanced
         if approach_enum.regime == "basel3":
-            pd_floors = PD_FLOORS_BASEL3
             scaling_factor = 1.0
 
+            # Basel/OSFI PD floors:
+            # - general PD floor 0.05% does not apply to sovereign asset class
+            pd_floors = {
+                "corporate": PD_FLOOR_BASEL3_GENERAL,
+                "bank": PD_FLOOR_BASEL3_GENERAL,
+                "sovereign": 0.0,  # not applied
+            }
+
+            # For A-IRB, own-LGD estimates are described as applicable to corporate/PSE/sovereign.
+            # Banks are treated conservatively as F-IRB supervisory LGD (with explicit note).
             if approach_enum == Approach.BASEL_III_IRB_ADVANCED:
                 irb_mode = "Basel III IRB - Advanced"
-                lgd_mode = "bank_estimated"
-                lgd_defaults = LGD_DEFAULTS_BASEL3_FIRB
-                # A-IRB: also apply LGD floors for bank-estimated LGD
-                lgd_floors = LGD_FLOORS_BASEL3
+
+                if asset_class_key == "bank":
+                    # Not applying A-IRB own-LGD to bank exposures in this simplified implementation.
+                    lgd_mode = "supervisory"
+                    lgd_defaults = LGD_DEFAULTS_BASEL3_FIRB
+                    lgd_floor_policy = {"enabled": False, "reason": "A-IRB own-LGD not applied to bank exposures in this implementation"}
+                else:
+                    lgd_mode = "bank_estimated"
+                    lgd_defaults = LGD_DEFAULTS_BASEL3_FIRB
+                    lgd_floor_policy = _get_basel3_lgd_floor_policy(
+                        floor_regime=floor_regime,
+                        asset_class_key=asset_class_key,
+                        collateral_type=collateral_type,
+                    )
             else:
-                # Foundation (also covers BASEL_III_IRB alias)
+                # Foundation
                 irb_mode = "Basel III IRB - Foundation"
                 lgd_mode = "supervisory"
                 lgd_defaults = LGD_DEFAULTS_BASEL3_FIRB
-                lgd_floors = {}  # no bank-estimated LGD floors applied for F-IRB
+                lgd_floor_policy = {"enabled": False, "reason": "Foundation uses supervisory LGD defaults"}
+
         else:
-            # Basel II IRB Foundation (existing prototype)
-            pd_floors = PD_FLOORS_BASEL2
+            # Basel II IRB Foundation (existing prototype behavior)
             scaling_factor = SCALING_FACTOR_BASEL2_IRB
             irb_mode = "Basel II IRB - Foundation"
+            # Basel II floor behavior kept as-is (prototype floors)
+            pd_floors = {
+                "corporate": 0.0003,
+                "bank": 0.0005,
+                "sovereign": 0.0005,
+            }
             lgd_mode = "supervisory"
             lgd_defaults = LGD_DEFAULTS_BASEL2_FIRB
-            lgd_floors = {}
+            lgd_floor_policy = {"enabled": False, "reason": "Basel II IRB floors not changed here"}
 
         irb_result = _calculate_irb_asrf(
             asset_class_key=asset_class_key,
@@ -227,7 +300,9 @@ def calculate_loan_capital(
             scaling_factor=scaling_factor,
             irb_mode=irb_mode,
             lgd_mode=lgd_mode,
-            lgd_floors=lgd_floors,
+            lgd_floor_policy=lgd_floor_policy,
+            jurisdiction=jurisdiction_norm,
+            floor_regime=floor_regime,
         )
 
         # Basel II IRB returns directly (no output floor)
@@ -277,6 +352,71 @@ def calculate_loan_capital(
         return irb_result
 
     return {"error": "Unsupported approach/method"}
+
+
+# ============================================================
+# Floor policy helpers
+# ============================================================
+def _get_basel3_lgd_floor_policy(
+    *,
+    floor_regime: str,
+    asset_class_key: str,
+    collateral_type: Optional[str],
+) -> Dict[str, Any]:
+    """
+    Returns an LGD floor policy dict:
+      {
+        enabled: bool,
+        floor_value: Optional[float],
+        floor_source: str,
+        rule_path: str,
+        inputs: {...}
+      }
+
+    If collateral_type is not provided, we apply the unsecured wholesale floor (25%)
+    for corporate (and for simplicity, also for bank if we ever choose to enable it).
+    For sovereign, Basel/OSFI notes floors do not apply.
+    """
+    if asset_class_key == "sovereign":
+        return {
+            "enabled": False,
+            "floor_value": None,
+            "floor_source": floor_regime,
+            "rule_path": "Basel III IRB: LGD parameter floors do not apply to sovereign asset class",
+            "inputs": {"collateral_type": collateral_type},
+        }
+
+    if floor_regime == FLOOR_REGIME["NONE"]:
+        return {
+            "enabled": False,
+            "floor_value": None,
+            "floor_source": floor_regime,
+            "rule_path": "No Basel III-final LGD floors applied (jurisdiction configured as NONE)",
+            "inputs": {"collateral_type": collateral_type},
+        }
+
+    # OSFI and BCBS share the same Basel Framework floor table for these parameters.
+    # We treat OSFI as "Canada", BCBS as optional baseline.
+    if collateral_type:
+        ct = collateral_type.strip().lower()
+        secured_map = LGD_FLOORS_BASEL_WHOLESALE["secured_by_collateral_type"]
+        if ct in secured_map:
+            return {
+                "enabled": True,
+                "floor_value": float(secured_map[ct]),
+                "floor_source": floor_regime,
+                "rule_path": f"Basel III IRB LGD floor (wholesale secured): collateral_type='{ct}' → floor={secured_map[ct]:.4f}",
+                "inputs": {"collateral_type": ct},
+            }
+
+    # Default to unsecured wholesale floor
+    return {
+        "enabled": True,
+        "floor_value": float(LGD_FLOORS_BASEL_WHOLESALE["unsecured"]),
+        "floor_source": floor_regime,
+        "rule_path": "Basel III IRB LGD floor (wholesale unsecured default): floor=25% (no collateral_type provided)",
+        "inputs": {"collateral_type": collateral_type},
+    }
 
 
 # ============================================================
@@ -460,11 +600,20 @@ def _calculate_irb_asrf(
     scaling_factor: float,
     irb_mode: str,
     lgd_mode: str,  # "supervisory" or "bank_estimated"
-    lgd_floors: Optional[Dict[str, float]] = None,
+    lgd_floor_policy: Dict[str, Any],
+    jurisdiction: str,
+    floor_regime: str,
 ) -> Dict[str, Any]:
+    # PD handling
     pd_in = _normalize_rate(pd, default=0.01)
-    pd_floor = pd_floors.get(asset_class_key, 0.0003)
-    pd_used = max(pd_in, pd_floor)
+
+    pd_floor = float(pd_floors.get(asset_class_key, 0.0))
+    if pd_floor <= 0.0:
+        pd_used = pd_in
+        pd_note = "No PD floor applied for this asset class"
+    else:
+        pd_used = max(pd_in, pd_floor)
+        pd_note = f"PD used = max(PD input {pd_in:.6f}, PD floor {pd_floor:.6f})"
 
     # Maturity in years (floor 1, cap 5; fallback 2.5)
     if maturity_months and maturity_months > 0:
@@ -472,39 +621,42 @@ def _calculate_irb_asrf(
     else:
         M = 2.5
 
-    # LGD handling:
-    # - Foundation: use supervisory LGD defaults
-    # - Advanced: use provided LGD (bank-estimated); if missing/<=0, fall back to default AND apply LGD floor if configured
-    lgd_default = lgd_defaults.get(asset_class_key, 0.45)
+    # LGD handling
+    lgd_default = float(lgd_defaults.get(asset_class_key, 0.45))
 
-    lgd_floor_value = None
     lgd_floor_applied = False
+    lgd_floor_value = None
     lgd_note = None
+    lgd_rule_path = None
 
     if lgd_mode == "supervisory":
-        lgd_used = float(lgd_default)
+        lgd_used = lgd_default
         lgd_source = "supervisory_default"
         lgd_note = f"Using supervisory default LGD={lgd_used:.4f}"
+        lgd_rule_path = "Supervisory LGD default (Foundation or constrained exposure type)"
     else:
-        # bank_estimated: normalize user-supplied lgd, but apply floor if configured
+        # bank_estimated: normalize user-supplied lgd
         lgd_in = _normalize_rate(lgd, default=lgd_default)
-        if lgd_floors and asset_class_key in lgd_floors:
-            lgd_floor_value = float(lgd_floors[asset_class_key])
-            if lgd_in < lgd_floor_value:
+        lgd_used = lgd_in
+        lgd_source = "bank_estimated" if (lgd is not None and float(lgd) > 0) else "default_used_missing_input"
+
+        # Apply LGD floor policy if enabled
+        if lgd_floor_policy.get("enabled") and lgd_floor_policy.get("floor_value") is not None:
+            lgd_floor_value = float(lgd_floor_policy["floor_value"])
+            lgd_rule_path = lgd_floor_policy.get("rule_path")
+
+            if lgd_used < lgd_floor_value:
                 lgd_used = lgd_floor_value
                 lgd_floor_applied = True
                 lgd_note = f"Bank-estimated LGD {lgd_in:.4f} raised to floor {lgd_floor_value:.4f}"
             else:
-                lgd_used = lgd_in
-                lgd_note = f"Bank-estimated LGD used: {lgd_used:.4f} (no floor applied)"
+                lgd_note = f"Bank-estimated LGD used: {lgd_used:.4f} (>= floor {lgd_floor_value:.4f})"
         else:
-            lgd_used = lgd_in
-            lgd_note = f"Bank-estimated LGD used: {lgd_used:.4f} (no floor configured)"
-
-        lgd_source = "bank_estimated" if (lgd is not None and float(lgd) > 0) else "default_used_missing_input"
+            lgd_rule_path = lgd_floor_policy.get("rule_path") or "No LGD floor applied"
+            lgd_note = f"Bank-estimated LGD used: {lgd_used:.4f} (no floor applied)"
 
     # Correlation (same functional form as existing prototype)
-    exp_term = math.exp(-50.0 * pd_used)
+    exp_term = math.exp(-50.0 * max(pd_used, 1e-12))
     denom = 1.0 - math.exp(-50.0)
     denom = denom if denom != 0 else 1e-12
     R = 0.12 * (1.0 - exp_term) / denom + 0.24 * (1.0 - (1.0 - exp_term) / denom)
@@ -528,8 +680,15 @@ def _calculate_irb_asrf(
         "approach_label": approach_enum.label,
         "irb_mode": irb_mode,
         "asset_class": asset_class_label,
+        "jurisdiction": jurisdiction,
+        "floor_regime": floor_regime,
+
+        "pd_input": pd_in,
         "pd_used": pd_used,
-        "pd_floor_applied": pd_floor,
+        "pd_floor": pd_floor if pd_floor > 0 else None,
+        "pd_note": pd_note,
+
+        "lgd_input": _normalize_rate(lgd, default=lgd_default),
         "lgd_mode": lgd_mode,
         "lgd_used": lgd_used,
         "lgd_source": lgd_source,
@@ -537,12 +696,16 @@ def _calculate_irb_asrf(
         "lgd_floor_applied": lgd_floor_applied,
         "lgd_floor_value": lgd_floor_value,
         "lgd_note": lgd_note,
+        "lgd_rule_path": lgd_rule_path,
+        "lgd_floor_policy": lgd_floor_policy,
+
         "maturity_years": M,
         "supervisory_correlation_R": R,
         "K_unadjusted": K,
         "maturity_adjustment_factor": maturity_adj,
         "K_adjusted": K_adj,
         "irb_scaling_factor": scaling_factor,
+
         "EAD": ead,
         "RWA": rwa,
         "effective_risk_weight_pct": f"{(rwa / ead) * 100:.2f}%" if ead and ead > 0 else None,
