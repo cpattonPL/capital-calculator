@@ -61,28 +61,27 @@ def calculate_loan_capital(
         # ------------------------
         # Basel II Standardized
         # ------------------------
-        if "basel ii" in approach_lower:
-            rw = get_standardized_risk_weight_basel2(
-                exposure_type=exposure_type,
-                rating_bucket=rating_bucket,
-                is_regulatory_retail=is_regulatory_retail,
-                is_prudent_mortgage=is_prudent_mortgage,
-            )
-            version = "Basel II"
+        # IMPORTANT: check Basel III before Basel II because "basel iii" contains "basel ii" as a substring
+    if "basel iii" in approach_lower:
+        rw = get_standardized_risk_weight_basel3(
+            exposure_type=exposure_type,
+            rating_bucket=rating_bucket,
+        )
+        version = "Basel III"
 
-        # ------------------------
-        # Basel III Standardized
-        # ------------------------
-        elif "basel iii" in approach_lower:
-            rw = get_standardized_risk_weight_basel3(
-                exposure_type=exposure_type,
-                rating_bucket=rating_bucket,
-            )
-            version = "Basel III"
+    elif "basel ii" in approach_lower:
+        rw = get_standardized_risk_weight_basel2(
+            exposure_type=exposure_type,
+            rating_bucket=rating_bucket,
+            is_regulatory_retail=is_regulatory_retail,
+            is_prudent_mortgage=is_prudent_mortgage,
+        )
+        version = "Basel II"
 
-        else:
-            rw = 1.0
-            version = "Unknown"
+    else:
+        rw = 1.0
+        version = "Unknown"
+
 
         rwa = ead * rw
         capital_required = rwa * capital_ratio
