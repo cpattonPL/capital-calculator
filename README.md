@@ -1,7 +1,8 @@
 # Capital Calculator (prototype)
 
 Prototype Streamlit app for regulatory capital calculations for loans and securitizations.
-This repo is a scaffold with calculation stubs and a working Streamlit UI. Replace the placeholders with the detailed regulatory formulas (see references below).
+This repo is intended to house functionality to be used in validation of future builds.  It has functionality for:
+Basel II and Basel III for both loans and securitizations.
 
 ## Quick start
 
