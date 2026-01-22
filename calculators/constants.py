@@ -1,12 +1,9 @@
+# calculators/constants.py
+
 from enum import Enum
 
 
 class RatingBucket(str, Enum):
-    """
-    Canonical rating buckets used across UI and calculations.
-    Values are stable internal identifiers.
-    """
-
     AAA_AA = "AAA_AA"
     A = "A"
     BBB = "BBB"
@@ -27,10 +24,6 @@ class RatingBucket(str, Enum):
 
 
 class ExposureType(str, Enum):
-    """
-    Canonical exposure types used across UI and calculations.
-    """
-
     CORPORATE = "CORPORATE"
     RETAIL = "RETAIL"
     RESIDENTIAL_MORTGAGE = "RESIDENTIAL_MORTGAGE"
@@ -49,4 +42,48 @@ class ExposureType(str, Enum):
             ExposureType.SOVEREIGN_CENTRAL_BANK: "Sovereign / Central Bank",
             ExposureType.BANK: "Bank",
             ExposureType.OTHER: "Other",
+        }[self]
+
+
+class Approach(str, Enum):
+    """
+    Canonical Approach enum.
+
+    - value is a stable internal identifier
+    - properties:
+        - label: human-friendly label for UI
+        - regime: 'basel2' or 'basel3'
+        - method: 'standardized' or 'irb'
+    """
+
+    BASEL_II_STANDARDIZED = "BASEL_II_STANDARDIZED"
+    BASEL_II_IRB = "BASEL_II_IRB"
+    BASEL_III_STANDARDIZED = "BASEL_III_STANDARDIZED"
+    BASEL_III_IRB = "BASEL_III_IRB"
+
+    @property
+    def label(self) -> str:
+        return {
+            Approach.BASEL_II_STANDARDIZED: "Basel II - Standardized",
+            Approach.BASEL_II_IRB: "Basel II - IRB (Foundation)",
+            Approach.BASEL_III_STANDARDIZED: "Basel III - Standardized",
+            Approach.BASEL_III_IRB: "Basel III - IRB (Final) — (NOT IMPLEMENTED)",
+        }[self]
+
+    @property
+    def regime(self) -> str:
+        return {
+            Approach.BASEL_II_STANDARDIZED: "basel2",
+            Approach.BASEL_II_IRB: "basel2",
+            Approach.BASEL_III_STANDARDIZED: "basel3",
+            Approach.BASEL_III_IRB: "basel3",
+        }[self]
+
+    @property
+    def method(self) -> str:
+        return {
+            Approach.BASEL_II_STANDARDIZED: "standardized",
+            Approach.BASEL_II_IRB: "irb",
+            Approach.BASEL_III_STANDARDIZED: "standardized",
+            Approach.BASEL_III_IRB: "irb",
         }[self]
