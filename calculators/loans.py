@@ -1,34 +1,70 @@
 # calculators/loans.py
 """
-Loan calculation module (Approach enum + ExposureType + RatingBucket).
+Loan calculation module.
 
-Notes:
-- This file expects calculators.constants.Approach, ExposureType, RatingBucket to exist.
-- Backwards compatibility: functions accept Approach or legacy string (coercion applied).
-- IRB implemented remains Basel II Foundation IRB (we'll add Basel III IRB later).
+Implements:
+- Basel II Standardized (simplified)
+- Basel III Standardized (Corporates, Banks, CRE) + CRE audit/debug details
+- Basel II IRB (Foundation) prototype (no output floor)
+- Basel III IRB (Foundation) + Output Floor
+- Basel III IRB (Advanced) + Output Floor
+
+Important:
+- We are intentionally deferring a more accurate Basel EAD/CCF function.
+- CRE continues to use EAD for LTV (so later EAD improvements won’t break CRE wiring).
 """
 
 import math
-from typing import Optional, Union
+from typing import Optional, Union, Tuple, Dict, Any
 
 from scipy.stats import norm
 
 from calculators.constants import Approach, ExposureType, RatingBucket
 
-# Basel II IRB scaling factor (kept for current IRB prototype)
-SCALING_FACTOR_IRB = 1.06
 
-# PD floors used in the current IRB prototype
-PD_FLOORS = {
-    "corporate": 0.0003,   # 0.03%
-    "bank": 0.0005,        # 0.05%
-    "sovereign": 0.0005,   # 0.05%
+# ----------------------------
+# Basel II IRB scaling factor
+# ----------------------------
+SCALING_FACTOR_BASEL2_IRB = 1.06
+
+# Basel III output floor (72.5% of standardized RWA)
+BASEL3_OUTPUT_FLOOR_PCT = 0.725
+
+
+# ----------------------------
+# PD floors (prototype)
+# ----------------------------
+PD_FLOORS_BASEL2 = {
+    "corporate": 0.0003,  # 0.03%
+    "bank": 0.0005,       # 0.05%
+    "sovereign": 0.0005,  # 0.05%
+}
+
+# Basel III PD floor (prototype)
+PD_FLOORS_BASEL3 = {
+    "corporate": 0.0005,  # 0.05%
+    "bank": 0.0005,       # 0.05%
+    "sovereign": 0.0005,  # 0.05%
+}
+
+# Supervisory LGD defaults for F-IRB (prototype defaults)
+LGD_DEFAULTS_BASEL2_FIRB = {
+    "corporate": 0.45,
+    "bank": 0.45,
+    "sovereign": 0.45,
+}
+
+# Basel III F-IRB supervisory LGD defaults (prototype)
+LGD_DEFAULTS_BASEL3_FIRB = {
+    "corporate": 0.40,
+    "bank": 0.45,
+    "sovereign": 0.45,
 }
 
 
-# ---------------------------
-# Public entrypoint
-# ---------------------------
+# ============================================================
+# PUBLIC ENTRYPOINT
+# ============================================================
 def calculate_loan_capital(
     approach: Union[Approach, str],
     ead: float,
@@ -43,41 +79,44 @@ def calculate_loan_capital(
     is_regulatory_retail: bool = False,
     is_prudent_mortgage: bool = False,
     capital_ratio: float = 0.08,
-):
-    """
-    Main entrypoint.
-
-    approach: Approach enum or legacy string (coerced)
-    exposure_type: ExposureType enum or legacy string (coerced)
-    rating_bucket: RatingBucket enum or legacy string (coerced)
-    """
-    # Coerce approach/exposure/rating
+    # CRE-specific optional parameters
+    property_value: Optional[float] = None,
+    property_income_dependent: bool = False,
+    counterparty_type: Optional[Union[ExposureType, str]] = None,
+) -> Dict[str, Any]:
     approach_enum = _coerce_approach(approach)
     et_enum = _coerce_exposure_type(exposure_type)
     rb_enum = _coerce_rating_bucket(rating_bucket)
+    cp_enum = _coerce_exposure_type(counterparty_type) if counterparty_type is not None else ExposureType.CORPORATE
 
-    # if coercion failed, fall back to previous string parsing behaviour conservatively
+    # fallback if coercion fails
     if approach_enum is None:
-        # try naive string parsing fallback
-        approach_str = (approach or "").lower()
-        if "basel iii" in approach_str and "standard" in approach_str:
+        s = (approach or "").lower()
+        if "basel iii" in s and "standard" in s:
             approach_enum = Approach.BASEL_III_STANDARDIZED
-        elif "basel iii" in approach_str and "irb" in approach_str:
-            approach_enum = Approach.BASEL_III_IRB
-        elif "irb" in approach_str:
+        elif "basel iii" in s and "advanced" in s and "irb" in s:
+            approach_enum = Approach.BASEL_III_IRB_ADVANCED
+        elif "basel iii" in s and "irb" in s:
+            approach_enum = Approach.BASEL_III_IRB_FOUNDATION
+        elif "irb" in s:
             approach_enum = Approach.BASEL_II_IRB
-        elif "basel ii" in approach_str and "standard" in approach_str:
+        elif "basel ii" in s and "standard" in s:
             approach_enum = Approach.BASEL_II_STANDARDIZED
         else:
-            approach_enum = Approach.BASEL_II_STANDARDIZED  # safe default
+            approach_enum = Approach.BASEL_II_STANDARDIZED
 
-    # Route by structured approach
+    # =========================
+    # STANDARDIZED
+    # =========================
     if approach_enum.method == "standardized":
-        # route to Basel III or Basel II standardized depending on regime
         if approach_enum.regime == "basel3":
-            rw = get_standardized_risk_weight_basel3(
+            rw, cre_details = get_standardized_risk_weight_basel3(
                 exposure_type=et_enum,
                 rating_bucket=rb_enum,
+                ead=ead,
+                property_value=property_value,
+                property_income_dependent=property_income_dependent,
+                counterparty_type=cp_enum,
             )
             version = "Basel III"
         else:
@@ -87,12 +126,13 @@ def calculate_loan_capital(
                 is_regulatory_retail=is_regulatory_retail,
                 is_prudent_mortgage=is_prudent_mortgage,
             )
+            cre_details = None
             version = "Basel II"
 
         rwa = ead * rw
         capital_required = rwa * capital_ratio
 
-        return {
+        out: Dict[str, Any] = {
             "approach_enum": approach_enum.name,
             "approach_label": approach_enum.label,
             "version": version,
@@ -101,107 +141,275 @@ def calculate_loan_capital(
             "risk_weight": rw,
             "risk_weight_pct": f"{rw * 100:.2f}%",
             "EAD": ead,
+            "property_value": property_value,
+            "LTV": (ead / property_value if property_value and property_value > 0 else None),
+            "property_income_dependent": property_income_dependent,
             "RWA": rwa,
             "capital_ratio": capital_ratio,
             "capital_required": capital_required,
         }
+        if cre_details is not None:
+            out["cre_details"] = cre_details
+        return out
 
-    # IRB route (method == 'irb')
+    # =========================
+    # IRB (Basel II + Basel III Foundation/Advanced)
+    # =========================
     if approach_enum.method == "irb":
-        # currently our IRB implementation is F-IRB (Basel II style); keep routing by exposure type
+        # Output floor applies to Basel III IRB (both F-IRB and A-IRB)
+        apply_output_floor = approach_enum.regime == "basel3"
+
+        # Determine asset_class_key from exposure type
+        asset_class_key = None
+        asset_class_label = None
         if et_enum == ExposureType.CORPORATE:
-            return _calculate_irb_foundation_asrf(
-                asset_class_key="corporate",
-                asset_class_label="Foundation IRB - Corporate",
+            asset_class_key = "corporate"
+            asset_class_label = "IRB - Corporate"
+        elif et_enum == ExposureType.BANK:
+            asset_class_key = "bank"
+            asset_class_label = "IRB - Bank"
+        elif et_enum == ExposureType.SOVEREIGN_CENTRAL_BANK:
+            asset_class_key = "sovereign"
+            asset_class_label = "IRB - Sovereign/Central Bank"
+        else:
+            return _calculate_irb_stub(
+                approach_enum=approach_enum,
                 ead=ead,
+                maturity_months=maturity_months,
                 pd=pd,
                 lgd=lgd,
-                maturity_months=maturity_months,
                 capital_ratio=capital_ratio,
-                approach_enum=approach_enum,
             )
 
-        if et_enum == ExposureType.BANK:
-            return _calculate_irb_foundation_asrf(
-                asset_class_key="bank",
-                asset_class_label="Foundation IRB - Bank",
-                ead=ead,
-                pd=pd,
-                lgd=lgd,
-                maturity_months=maturity_months,
-                capital_ratio=capital_ratio,
-                approach_enum=approach_enum,
-            )
+        # Basel III IRB branching: Foundation vs Advanced
+        if approach_enum.regime == "basel3":
+            pd_floors = PD_FLOORS_BASEL3
+            scaling_factor = 1.0
 
-        if et_enum == ExposureType.SOVEREIGN_CENTRAL_BANK:
-            return _calculate_irb_foundation_asrf(
-                asset_class_key="sovereign",
-                asset_class_label="Foundation IRB - Sovereign/Central Bank",
-                ead=ead,
-                pd=pd,
-                lgd=lgd,
-                maturity_months=maturity_months,
-                capital_ratio=capital_ratio,
-                approach_enum=approach_enum,
-            )
+            if approach_enum == Approach.BASEL_III_IRB_ADVANCED:
+                irb_mode = "Basel III IRB - Advanced"
+                lgd_mode = "bank_estimated"
+                lgd_defaults = LGD_DEFAULTS_BASEL3_FIRB  # used only if input missing
+            else:
+                # Foundation (also covers BASEL_III_IRB alias)
+                irb_mode = "Basel III IRB - Foundation"
+                lgd_mode = "supervisory"
+                lgd_defaults = LGD_DEFAULTS_BASEL3_FIRB
 
-        return _calculate_irb_stub(
-            approach_enum=approach_enum,
+        else:
+            # Basel II IRB Foundation (existing prototype)
+            pd_floors = PD_FLOORS_BASEL2
+            scaling_factor = SCALING_FACTOR_BASEL2_IRB
+            irb_mode = "Basel II IRB - Foundation"
+            lgd_mode = "supervisory"
+            lgd_defaults = LGD_DEFAULTS_BASEL2_FIRB
+
+        irb_result = _calculate_irb_asrf(
+            asset_class_key=asset_class_key,
+            asset_class_label=asset_class_label,
             ead=ead,
-            maturity_months=maturity_months,
             pd=pd,
             lgd=lgd,
+            maturity_months=maturity_months,
             capital_ratio=capital_ratio,
+            approach_enum=approach_enum,
+            pd_floors=pd_floors,
+            lgd_defaults=lgd_defaults,
+            scaling_factor=scaling_factor,
+            irb_mode=irb_mode,
+            lgd_mode=lgd_mode,
         )
+
+        # Basel II IRB returns directly (no output floor)
+        if not apply_output_floor:
+            return irb_result
+
+        # Basel III Output Floor:
+        # compare IRB RWA to 72.5% of Basel III standardized RWA
+        std_rw, std_cre_details = get_standardized_risk_weight_basel3(
+            exposure_type=et_enum,
+            rating_bucket=rb_enum,
+            ead=ead,
+            property_value=property_value,
+            property_income_dependent=property_income_dependent,
+            counterparty_type=cp_enum,
+        )
+        rwa_std = ead * std_rw
+        floor_rwa = BASEL3_OUTPUT_FLOOR_PCT * rwa_std
+
+        rwa_irb_pre_floor = float(irb_result.get("RWA", 0.0))
+        rwa_final = max(rwa_irb_pre_floor, float(floor_rwa))
+        capital_required_final = rwa_final * float(capital_ratio)
+
+        irb_result["output_floor"] = {
+            "enabled": True,
+            "floor_pct_of_standardized_rwa": BASEL3_OUTPUT_FLOOR_PCT,
+            "standardized_version_used": "Basel III",
+            "standardized_risk_weight": std_rw,
+            "standardized_risk_weight_pct": f"{std_rw * 100:.2f}%",
+            "standardized_rwa": rwa_std,
+            "floor_rwa": floor_rwa,
+            "rwa_irb_pre_floor": rwa_irb_pre_floor,
+            "rwa_final_post_floor": rwa_final,
+            "binding": rwa_final > rwa_irb_pre_floor + 1e-12,
+            "notes": "RWA_final = max(RWA_IRB, 72.5% × RWA_Standardized).",
+        }
+        if std_cre_details is not None:
+            irb_result["output_floor"]["standardized_cre_details"] = std_cre_details
+
+        # Align top-level outputs with post-floor values
+        irb_result["RWA"] = rwa_final
+        irb_result["capital_required"] = capital_required_final
+        irb_result["effective_risk_weight_pct"] = (
+            f"{(rwa_final / ead) * 100:.2f}%" if ead and ead > 0 else None
+        )
+
+        return irb_result
 
     return {"error": "Unsupported approach/method"}
 
 
-# ---------------------------
-# Standardized helpers
-# ---------------------------
+# ============================================================
+# BASEL III STANDARDIZED
+# Returns: (risk_weight, cre_details_or_none)
+# ============================================================
 def get_standardized_risk_weight_basel3(
     exposure_type: Optional[ExposureType],
     rating_bucket: Optional[RatingBucket],
-) -> float:
-    """
-    Basel III Standardized (SCRA) simplified: Corporates & Banks implemented.
-    """
+    *,
+    ead: Optional[float] = None,
+    property_value: Optional[float] = None,
+    property_income_dependent: bool = False,
+    counterparty_type: Optional[ExposureType] = None,
+) -> Tuple[float, Optional[dict]]:
+    # Corporate SCRA
     if exposure_type == ExposureType.CORPORATE:
         if rating_bucket in {RatingBucket.AAA_AA, RatingBucket.A, RatingBucket.BBB}:
-            return 0.75
+            return 0.75, None
         if rating_bucket == RatingBucket.BB_B:
-            return 1.00
+            return 1.00, None
         if rating_bucket == RatingBucket.BELOW_B:
-            return 1.50
-        return 1.00
+            return 1.50, None
+        return 1.00, None
 
+    # Bank SCRA
     if exposure_type == ExposureType.BANK:
         if rating_bucket == RatingBucket.AAA_AA:
-            return 0.20
+            return 0.20, None
         if rating_bucket == RatingBucket.A:
-            return 0.50
+            return 0.50, None
         if rating_bucket == RatingBucket.BBB:
-            return 0.75
+            return 0.75, None
         if rating_bucket == RatingBucket.BB_B:
-            return 1.00
+            return 1.00, None
         if rating_bucket == RatingBucket.BELOW_B:
-            return 1.50
-        return 1.00
+            return 1.50, None
+        return 1.00, None
 
-    # Not implemented: residential, CRE, retail under Basel III standardized
-    return 1.00
+    # CRE
+    if exposure_type == ExposureType.COMMERCIAL_REAL_ESTATE:
+        return _basel3_cre_risk_weight_with_details(
+            rating_bucket=rating_bucket,
+            ead=ead,
+            property_value=property_value,
+            property_income_dependent=property_income_dependent,
+            counterparty_type=counterparty_type or ExposureType.CORPORATE,
+        )
+
+    return 1.00, None
 
 
+def _basel3_cre_risk_weight_with_details(
+    *,
+    rating_bucket: Optional[RatingBucket],
+    ead: Optional[float],
+    property_value: Optional[float],
+    property_income_dependent: bool,
+    counterparty_type: ExposureType,
+) -> Tuple[float, dict]:
+    ltv = None
+    if property_value and property_value > 0 and ead is not None:
+        ltv = float(ead) / float(property_value)
+
+    # Counterparty RW (for general CRE)
+    cp_rw, _ = get_standardized_risk_weight_basel3(
+        exposure_type=counterparty_type,
+        rating_bucket=rating_bucket,
+        ead=None,
+        property_value=None,
+        property_income_dependent=False,
+        counterparty_type=None,
+    )
+    if counterparty_type not in {ExposureType.CORPORATE, ExposureType.BANK}:
+        cp_rw = max(cp_rw, 1.00)
+
+    details = {
+        "asset_class": "CRE",
+        "property_income_dependent": property_income_dependent,
+        "counterparty_type": (counterparty_type.name if counterparty_type else None),
+        "counterparty_rw": cp_rw,
+        "ltv": ltv,
+        "ltv_bucket": None,
+        "rule_path": None,
+        "rw_applied": None,
+    }
+
+    # Income-producing CRE
+    if property_income_dependent:
+        if ltv is None:
+            rw = 1.10
+            details["ltv_bucket"] = "Unknown (no property_value)"
+            details["rule_path"] = "Basel III CRE (income-dependent): LTV unknown → default RW 110%"
+            details["rw_applied"] = rw
+            return rw, details
+
+        if ltv <= 0.60:
+            rw = 0.70
+            details["ltv_bucket"] = "<= 60%"
+            details["rule_path"] = "Basel III CRE (income-dependent): LTV <= 60% → RW 70%"
+        elif ltv <= 0.80:
+            rw = 0.90
+            details["ltv_bucket"] = "60%–80%"
+            details["rule_path"] = "Basel III CRE (income-dependent): 60% < LTV <= 80% → RW 90%"
+        else:
+            rw = 1.10
+            details["ltv_bucket"] = "> 80%"
+            details["rule_path"] = "Basel III CRE (income-dependent): LTV > 80% → RW 110%"
+
+        details["rw_applied"] = rw
+        return rw, details
+
+    # General CRE
+    if ltv is not None:
+        if ltv <= 0.60:
+            rw = min(0.60, cp_rw)
+            details["ltv_bucket"] = "<= 60%"
+            details["rule_path"] = "Basel III CRE (general): LTV <= 60% → RW = min(60%, RW_counterparty)"
+            details["rw_applied"] = rw
+            return rw, details
+
+        rw = cp_rw
+        details["ltv_bucket"] = "> 60%"
+        details["rule_path"] = "Basel III CRE (general): LTV > 60% → RW = RW_counterparty"
+        details["rw_applied"] = rw
+        return rw, details
+
+    rw = max(cp_rw, 1.00)
+    details["ltv_bucket"] = "Unknown (no property_value)"
+    details["rule_path"] = "Basel III CRE (general): LTV unknown → RW = max(RW_counterparty, 100%)"
+    details["rw_applied"] = rw
+    return rw, details
+
+
+# ============================================================
+# BASEL II STANDARDIZED (simplified)
+# ============================================================
 def get_standardized_risk_weight_basel2(
     exposure_type: Optional[ExposureType],
     rating_bucket: Optional[RatingBucket],
     is_regulatory_retail: bool,
     is_prudent_mortgage: bool,
 ) -> float:
-    """
-    Basel II simplified mappings (enum-aware).
-    """
     if exposure_type == ExposureType.CORPORATE:
         if rating_bucket == RatingBucket.AAA_AA:
             return 0.20
@@ -224,10 +432,10 @@ def get_standardized_risk_weight_basel2(
     return 1.00
 
 
-# ---------------------------
-# IRB Foundation (shared ASRF)
-# ---------------------------
-def _calculate_irb_foundation_asrf(
+# ============================================================
+# IRB ASRF CORE (parameterized)
+# ============================================================
+def _calculate_irb_asrf(
     asset_class_key: str,
     asset_class_label: str,
     ead: float,
@@ -236,22 +444,36 @@ def _calculate_irb_foundation_asrf(
     maturity_months: int,
     capital_ratio: float,
     approach_enum: Approach,
-):
-    """
-    Shared IRB ASRF. The approach_enum is passed for traceability, although in this
-    prototype the math remains the same (Basel II F-IRB).
-    """
+    *,
+    pd_floors: Dict[str, float],
+    lgd_defaults: Dict[str, float],
+    scaling_factor: float,
+    irb_mode: str,
+    lgd_mode: str,  # "supervisory" or "bank_estimated"
+) -> Dict[str, Any]:
     pd_in = _normalize_rate(pd, default=0.01)
-    lgd_in = _normalize_rate(lgd, default=0.45)
-
-    pd_floor = PD_FLOORS.get(asset_class_key, 0.0003)
+    pd_floor = pd_floors.get(asset_class_key, 0.0003)
     pd_used = max(pd_in, pd_floor)
 
+    # Maturity in years (floor 1, cap 5; fallback 2.5)
     if maturity_months and maturity_months > 0:
         M = min(5.0, max(1.0, float(maturity_months) / 12.0))
     else:
         M = 2.5
 
+    # LGD handling:
+    # - Foundation: use supervisory LGD defaults
+    # - Advanced: use provided LGD (bank-estimated); if missing/<=0, fall back to default
+    lgd_default = lgd_defaults.get(asset_class_key, 0.45)
+    if lgd_mode == "supervisory":
+        lgd_used = float(lgd_default)
+        lgd_source = "supervisory_default"
+    else:
+        # bank_estimated
+        lgd_used = _normalize_rate(lgd, default=lgd_default)
+        lgd_source = "bank_estimated" if (lgd is not None and float(lgd) > 0) else "default_used_missing_input"
+
+    # Correlation (same functional form as existing prototype)
     exp_term = math.exp(-50.0 * pd_used)
     denom = 1.0 - math.exp(-50.0)
     denom = denom if denom != 0 else 1e-12
@@ -264,28 +486,34 @@ def _calculate_irb_foundation_asrf(
         + math.sqrt(R / (1.0 - R)) * norm.ppf(0.999)
     )
 
-    K = lgd_in * norm.cdf(term) - pd_used * lgd_in
+    K = lgd_used * norm.cdf(term) - pd_used * lgd_used
     maturity_adj = (1.0 + (M - 2.5) * b) / (1.0 - 1.5 * b)
     K_adj = K * maturity_adj
 
-    rwa = 12.5 * SCALING_FACTOR_IRB * K_adj * ead
+    rwa = 12.5 * scaling_factor * K_adj * ead
     capital_required = rwa * capital_ratio
 
     return {
         "approach_enum": approach_enum.name,
         "approach_label": approach_enum.label,
-        "irb_treatment": asset_class_label,
+        "irb_mode": irb_mode,
+        "asset_class": asset_class_label,
         "pd_used": pd_used,
-        "lgd_used": lgd_in,
+        "pd_floor_applied": pd_floor,
+        "lgd_mode": lgd_mode,
+        "lgd_used": lgd_used,
+        "lgd_source": lgd_source,
+        "lgd_default": lgd_default,
         "maturity_years": M,
         "supervisory_correlation_R": R,
         "K_unadjusted": K,
         "maturity_adjustment_factor": maturity_adj,
         "K_adjusted": K_adj,
-        "irb_scaling_factor": SCALING_FACTOR_IRB,
+        "irb_scaling_factor": scaling_factor,
         "EAD": ead,
         "RWA": rwa,
         "effective_risk_weight_pct": f"{(rwa / ead) * 100:.2f}%" if ead and ead > 0 else None,
+        "capital_ratio": capital_ratio,
         "capital_required": capital_required,
     }
 
@@ -297,16 +525,17 @@ def _calculate_irb_stub(
     pd: float,
     lgd: float,
     capital_ratio: float,
-):
+) -> Dict[str, Any]:
     return {
         "approach_enum": approach_enum.name,
+        "approach_label": approach_enum.label,
         "notes": "IRB stub — asset class not yet implemented.",
     }
 
 
-# ---------------------------
+# ============================================================
 # Utilities: normalization & coercion
-# ---------------------------
+# ============================================================
 def _normalize_rate(x, default: float) -> float:
     if x is None:
         return float(default)
@@ -365,6 +594,7 @@ def _coerce_exposure_type(et: Union[ExposureType, str, None]) -> Optional[Exposu
             "retail": ExposureType.RETAIL,
             "residential mortgage": ExposureType.RESIDENTIAL_MORTGAGE,
             "commercial real estate": ExposureType.COMMERCIAL_REAL_ESTATE,
+            "commercial_real_estate": ExposureType.COMMERCIAL_REAL_ESTATE,
             "sovereign / central bank": ExposureType.SOVEREIGN_CENTRAL_BANK,
             "sovereign/central bank": ExposureType.SOVEREIGN_CENTRAL_BANK,
             "sovereign": ExposureType.SOVEREIGN_CENTRAL_BANK,
@@ -378,37 +608,29 @@ def _coerce_exposure_type(et: Union[ExposureType, str, None]) -> Optional[Exposu
 
 
 def _coerce_approach(a: Union[Approach, str, None]) -> Optional[Approach]:
-    """
-    Coerce approaches from enum or legacy label/string.
-
-    Acceptable:
-      - Approach enum (returned unchanged)
-      - Enum value string (e.g., "BASEL_III_STANDARDIZED")
-      - Label (e.g., "Basel III - Standardized")
-      - Legacy strings containing "basel" / "irb" (best-effort)
-    """
     if a is None:
         return None
     if isinstance(a, Approach):
         return a
     if isinstance(a, str):
         s = a.strip()
-        # direct enum match by value
         value_map = {e.value: e for e in Approach}
         if s in value_map:
             return value_map[s]
-        # label match
         label_map = {e.label.lower(): e for e in Approach}
         if s.lower() in label_map:
             return label_map[s.lower()]
-        # best-effort parsing
+
         s_low = s.lower()
         if "basel iii" in s_low and "standard" in s_low:
             return Approach.BASEL_III_STANDARDIZED
+        if "basel iii" in s_low and "advanced" in s_low and "irb" in s_low:
+            return Approach.BASEL_III_IRB_ADVANCED
         if "basel iii" in s_low and "irb" in s_low:
-            return Approach.BASEL_III_IRB
+            return Approach.BASEL_III_IRB_FOUNDATION
         if "basel ii" in s_low and "standard" in s_low:
             return Approach.BASEL_II_STANDARDIZED
         if "irb" in s_low:
             return Approach.BASEL_II_IRB
+
     return None

@@ -1,199 +1,276 @@
+# app.py
 import streamlit as st
-import pandas as pd
-import numpy as np
 
-from calculators.common import compute_ead, format_currency
 from calculators.loans import calculate_loan_capital
-from calculators.securitizations import calculate_securitization_capital
 from calculators.constants import Approach, ExposureType, RatingBucket
 
+
 st.set_page_config(page_title="Capital Calculator", layout="wide")
-
-st.title("Capital Calculator — Loans & Securitizations")
-st.markdown(
-    "Choose an exposure type, specify characteristics and pick a regulatory approach. "
-    "This prototype provides a scaffold — replace placeholder pieces with the exact "
-    "regulatory formulas (see docs)."
-)
-
-# Global selection: Loans or Securitization
-exposure_choice = st.selectbox("Exposure type", ["Loans", "Securitization"])
-
-# =========================
-# LOANS
-# =========================
-if exposure_choice == "Loans":
-    st.header("Loan characteristics")
-
-    # Existing loan inputs
-    loan_type = st.selectbox("Loan type", ["Term", "LOC", "LC"])
-    commitment_amount = st.number_input(
-        "Commitment Amount",
-        min_value=0.0,
-        value=1_000_000.0,
-        step=1_000.0,
-    )
-    utilization_pct = st.number_input(
-        "Utilization Percent (0-100)",
-        min_value=0.0,
-        max_value=100.0,
-        value=100.0,
-    )
-    balance = st.number_input(
-        "Balance (if different from Commitment * Utilization)",
-        value=commitment_amount * (utilization_pct / 100.0),
-    )
-    maturity_months = st.number_input(
-        "Maturity Term (months)",
-        min_value=1,
-        value=60,
-    )
-    amortization_months = st.number_input(
-        "Amortization Term (months)",
-        min_value=1,
-        value=60,
-    )
-    interest_rate = st.number_input(
-        "Interest Rate (annual %)",
-        min_value=0.0,
-        value=4.5,
-    )
-
-    # PD / LGD inputs (used for IRB; may be ignored/overridden for standardized)
-    pd_input = st.number_input(
-        "Probability of Default (PD, decimal or %)",
-        min_value=0.0,
-        value=0.01,
-        help=(
-            "If the regulatory approach requires PD, you can input here. "
-            "Otherwise this may be ignored or replaced by the approach."
-        ),
-    )
-    lgd_input = st.number_input(
-        "Loss Given Default (LGD, decimal or %)",
-        min_value=0.0,
-        value=0.45,
-        help=(
-            "If the regulatory approach requires LGD, you can input here. "
-            "Otherwise this may be ignored or replaced by the approach."
-        ),
-    )
-
-    st.markdown("---")
-    st.subheader("Capital settings")
-
-    capital_ratio = st.number_input(
-        "Capital Ratio (e.g. 0.08 = 8%)",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.08,
-        step=0.005,
-        help=(
-            "Target capital ratio applied to RWA. "
-            "Basel minimum total capital is typically 8%, "
-            "but banks often use higher internal targets."
-        ),
-    )
+st.title("Capital Calculator")
 
 
-    st.markdown("---")
-    st.subheader("Standardized exposure classification")
-
-    # NEW: standardized exposure type (Basel asset class)
-    exposure_type = st.selectbox(
-        "Exposure Type (asset class)",
-        options=list(ExposureType),
-        format_func=lambda et: et.label,
-    )
+def _currency(x: float) -> str:
+    try:
+        return f"${x:,.2f}"
+    except Exception:
+        return str(x)
 
 
-    # NEW: rating bucket used by standardized approach (if relevant)
-    rating_bucket = st.selectbox(
-        "External rating bucket (if applicable)",
-        options=list(RatingBucket),
-        format_func=lambda rb: rb.label,
-    )
+def _pct(x: float) -> str:
+    try:
+        return f"{x * 100:.2f}%"
+    except Exception:
+        return str(x)
 
 
-    # NEW: flags that influence standardized mapping
-    is_regulatory_retail = st.checkbox(
-        "Regulatory retail portfolio (for Retail)",
-        value=True,
-        help="Relevant if Exposure Type = Retail. 75% RW typically applies to qualifying retail portfolios.",
-    )
-    is_prudent_mortgage = st.checkbox(
-        "Prudently underwritten residential mortgage (for Residential Mortgage)",
-        value=True,
-        help="Relevant if Exposure Type = Residential Mortgage. Standard Basel II RW is 35% for prudently underwritten mortgages.",
-    )
-
-    st.markdown("---")
-    st.subheader("Choose regulatory approach")
+with st.sidebar:
+    st.header("Approach & Exposure")
 
     approach = st.selectbox(
         "Capital approach",
         options=list(Approach),
         format_func=lambda a: a.label,
+        index=list(Approach).index(Approach.BASEL_III_STANDARDIZED)
+        if Approach.BASEL_III_STANDARDIZED in list(Approach)
+        else 0,
     )
 
-    if st.button("Calculate loan capital"):
-        ead = compute_ead(commitment_amount, balance, loan_type, utilization_pct)
-        result = calculate_loan_capital(
-            approach=approach,
-            ead=ead,
-            balance=balance,
-            maturity_months=maturity_months,
-            amortization_months=amortization_months,
-            interest_rate=interest_rate,
-            pd=pd_input,
-            lgd=lgd_input,
-            exposure_type=exposure_type,   # enum
-            rating_bucket=rating_bucket,   # enum
-            is_regulatory_retail=is_regulatory_retail,
-            is_prudent_mortgage=is_prudent_mortgage,
-            capital_ratio=capital_ratio,
-        )
+    exposure_type = st.selectbox(
+        "Exposure Type (asset class)",
+        options=list(ExposureType),
+        format_func=lambda et: et.label,
+        index=0,
+    )
+
+    rating_bucket = st.selectbox(
+        "External rating bucket (if applicable)",
+        options=list(RatingBucket),
+        format_func=lambda rb: rb.label,
+        index=list(RatingBucket).index(RatingBucket.UNRATED),
+    )
+
+    st.divider()
+    st.header("Capital Settings")
+    capital_ratio = st.number_input(
+        "Capital Ratio",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.08,
+        step=0.005,
+        format="%.4f",
+        help="Example: 0.08 for 8%",
+    )
 
 
+st.header("Loan Inputs")
 
-        st.write("### Results")
-        st.write(f"Exposure at Default (EAD): {format_currency(ead)}")
-        st.json(result)
+col1, col2, col3 = st.columns(3)
 
-# =========================
-# SECURITIZATIONS
-# =========================
-else:
-    st.header("Securitization characteristics")
-
-    exposure_amount = st.number_input(
-        "Exposure Amount",
+with col1:
+    loan_type = st.selectbox("Loan type", options=["Term", "LOC", "LC"], index=0)
+    commitment = st.number_input(
+        "Commitment Amount",
         min_value=0.0,
         value=1_000_000.0,
+        step=50_000.0,
+        format="%.2f",
+        help="Authorized amount available to borrower",
     )
-    tranche_rating = st.text_input("Tranche external rating (if available)", value="")
-    tranche_credit_enhancement = st.number_input(
-        "Credit enhancement (%)",
+    utilization_pct = st.number_input(
+        "Utilization Percent",
         min_value=0.0,
-        max_value=100.0,
-        value=10.0,
-    )
-    secur_approach = st.selectbox(
-        "Securitization Approach",
-        [
-            "SSFA (Basel II - SSFA)",
-            "SEC-SA (Basel III - SEC-SA)",
-            "SEC-ERBA (Basel III - ERBA)",
-            "SEC-IRB (Basel III - IRB)",
-        ],
+        max_value=1.0,
+        value=1.0 if loan_type == "Term" else 0.50,
+        step=0.05,
+        format="%.4f",
+        help="Use 1.0 for 100%",
+        disabled=(loan_type == "Term"),
     )
 
-    if st.button("Calculate securitization capital"):
-        result = calculate_securitization_capital(
-            approach=secur_approach,
-            exposure_amount=exposure_amount,
-            tranche_rating=tranche_rating,
-            credit_enhancement=tranche_credit_enhancement,
+with col2:
+    maturity_months = st.number_input(
+        "Maturity Term (months)",
+        min_value=1,
+        value=36,
+        step=1,
+        help="Number of months until maturity (full principal repayment required)",
+    )
+    amortization_months = st.number_input(
+        "Amortization Term (months)",
+        min_value=1,
+        value=60,
+        step=1,
+        help="Number of months the loan is amortized (e.g., 12 to 360)",
+    )
+    interest_rate = st.number_input(
+        "Interest Rate",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.06,
+        step=0.005,
+        format="%.4f",
+        help="Example: 0.06 for 6%",
+    )
+
+with col3:
+    pd_input = st.number_input(
+        "Probability of Default (PD)",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.01,
+        step=0.001,
+        format="%.6f",
+        help="Decimal form (0.01 = 1%). IRB uses PD; Standardized may ignore.",
+    )
+    lgd_input = st.number_input(
+        "Loss Given Default (LGD)",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.45,
+        step=0.01,
+        format="%.4f",
+        help="Decimal form (0.45 = 45%). For Basel III IRB Advanced, this is used as bank-estimated LGD.",
+    )
+
+# Derived balance & EAD (simple prototype)
+if loan_type == "Term":
+    balance = commitment
+else:
+    balance = commitment * utilization_pct
+
+ead = balance
+
+st.caption(
+    f"Derived Balance: **{_currency(balance)}** | Derived EAD (prototype): **{_currency(ead)}**"
+)
+
+# Basel II standardized toggles (kept)
+st.subheader("Additional Flags (mainly Basel II Standardized)")
+flag_col1, flag_col2 = st.columns(2)
+with flag_col1:
+    is_regulatory_retail = st.checkbox("Regulatory Retail (Basel II)", value=False)
+with flag_col2:
+    is_prudent_mortgage = st.checkbox("Prudent Mortgage (Basel II)", value=False)
+
+# ============================================================
+# CRE UI Fields
+# ============================================================
+st.subheader("CRE Inputs (Basel III Standardized – Commercial Real Estate)")
+
+show_cre_fields = (
+    approach == Approach.BASEL_III_STANDARDIZED
+    and exposure_type == ExposureType.COMMERCIAL_REAL_ESTATE
+)
+
+if show_cre_fields:
+    cre1, cre2, cre3 = st.columns(3)
+
+    with cre1:
+        property_value = st.number_input(
+            "Property Value",
+            min_value=0.0,
+            value=2_000_000.0,
+            step=50_000.0,
+            format="%.2f",
+            help="Used to compute LTV = EAD / Property Value",
         )
-        st.write("### Results")
-        st.json(result)
+
+    with cre2:
+        property_income_dependent = st.checkbox(
+            "Income-producing / cashflow-dependent CRE?",
+            value=False,
+            help="Check if repayment is materially dependent on property cash flows.",
+        )
+
+    with cre3:
+        counterparty_type = st.selectbox(
+            "Counterparty Type (used for CRE fallback rules)",
+            options=list(ExposureType),
+            format_func=lambda et: et.label,
+            index=list(ExposureType).index(ExposureType.CORPORATE),
+        )
+
+    ltv = (ead / property_value) if property_value and property_value > 0 else None
+    st.caption(f"LTV (derived): **{_pct(ltv)}**" if ltv is not None else "LTV (derived): N/A")
+
+else:
+    property_value = None
+    property_income_dependent = False
+    counterparty_type = None
+    st.info("Select **Basel III – Standardized** and **Commercial Real Estate** to enable CRE-specific inputs.")
+
+st.divider()
+
+if st.button("Run Calculation", type="primary"):
+    result = calculate_loan_capital(
+        approach=approach,
+        ead=ead,
+        balance=balance,
+        maturity_months=int(maturity_months),
+        amortization_months=int(amortization_months),
+        interest_rate=float(interest_rate),
+        pd=float(pd_input),
+        lgd=float(lgd_input),
+        exposure_type=exposure_type,
+        rating_bucket=rating_bucket,
+        is_regulatory_retail=bool(is_regulatory_retail),
+        is_prudent_mortgage=bool(is_prudent_mortgage),
+        capital_ratio=float(capital_ratio),
+        property_value=property_value,
+        property_income_dependent=bool(property_income_dependent),
+        counterparty_type=counterparty_type,
+    )
+
+    st.subheader("Results")
+
+    key_cols = st.columns(4)
+    with key_cols[0]:
+        if "risk_weight_pct" in result:
+            st.metric("Risk Weight", result["risk_weight_pct"])
+        elif "effective_risk_weight_pct" in result:
+            st.metric("Effective Risk Weight", result["effective_risk_weight_pct"])
+    with key_cols[1]:
+        if "RWA" in result:
+            st.metric("RWA", _currency(result["RWA"]))
+    with key_cols[2]:
+        if "capital_required" in result:
+            st.metric("Capital Required", _currency(result["capital_required"]))
+    with key_cols[3]:
+        if "version" in result:
+            st.metric("Version", result["version"])
+        elif "irb_mode" in result:
+            st.metric("IRB Mode", result["irb_mode"])
+
+    # CRE details section
+    if "cre_details" in result and isinstance(result["cre_details"], dict):
+        st.subheader("CRE details (bucket + rule path)")
+        cd = result["cre_details"]
+
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            st.write("**Rule path**")
+            st.write(cd.get("rule_path"))
+        with d2:
+            st.write("**LTV bucket**")
+            st.write(cd.get("ltv_bucket"))
+            st.write("**LTV**")
+            st.write(cd.get("ltv"))
+        with d3:
+            st.write("**Counterparty**")
+            st.write(cd.get("counterparty_type"))
+            st.write("**Counterparty RW**")
+            st.write(cd.get("counterparty_rw"))
+            st.write("**RW applied**")
+            st.write(cd.get("rw_applied"))
+
+        st.caption("Full CRE detail payload:")
+        st.json(cd)
+
+    # Output floor section (Basel III IRB)
+    if "output_floor" in result and isinstance(result["output_floor"], dict):
+        st.subheader("Basel III Output Floor details")
+        st.json(result["output_floor"])
+
+    # Full result payload
+    st.subheader("Full result payload")
+    st.json(result)

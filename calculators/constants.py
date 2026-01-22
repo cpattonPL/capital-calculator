@@ -47,27 +47,35 @@ class ExposureType(str, Enum):
 
 class Approach(str, Enum):
     """
-    Canonical Approach enum.
+    Canonical approach enum.
 
-    - value is a stable internal identifier
-    - properties:
-        - label: human-friendly label for UI
-        - regime: 'basel2' or 'basel3'
-        - method: 'standardized' or 'irb'
+    Properties:
+      - label: UI label
+      - regime: 'basel2' or 'basel3'
+      - method: 'standardized' or 'irb'
     """
 
     BASEL_II_STANDARDIZED = "BASEL_II_STANDARDIZED"
     BASEL_II_IRB = "BASEL_II_IRB"
+
     BASEL_III_STANDARDIZED = "BASEL_III_STANDARDIZED"
-    BASEL_III_IRB = "BASEL_III_IRB"
+
+    BASEL_III_IRB_FOUNDATION = "BASEL_III_IRB_FOUNDATION"
+    BASEL_III_IRB_ADVANCED = "BASEL_III_IRB_ADVANCED"
+
+    # Backward-compat alias: older code might reference BASEL_III_IRB
+    BASEL_III_IRB = "BASEL_III_IRB_FOUNDATION"
 
     @property
     def label(self) -> str:
         return {
             Approach.BASEL_II_STANDARDIZED: "Basel II - Standardized",
             Approach.BASEL_II_IRB: "Basel II - IRB (Foundation)",
+
             Approach.BASEL_III_STANDARDIZED: "Basel III - Standardized",
-            Approach.BASEL_III_IRB: "Basel III - IRB (Final) — (NOT IMPLEMENTED)",
+
+            Approach.BASEL_III_IRB_FOUNDATION: "Basel III - IRB (Foundation) + Output Floor",
+            Approach.BASEL_III_IRB_ADVANCED: "Basel III - IRB (Advanced) + Output Floor",
         }[self]
 
     @property
@@ -75,8 +83,11 @@ class Approach(str, Enum):
         return {
             Approach.BASEL_II_STANDARDIZED: "basel2",
             Approach.BASEL_II_IRB: "basel2",
+
             Approach.BASEL_III_STANDARDIZED: "basel3",
-            Approach.BASEL_III_IRB: "basel3",
+
+            Approach.BASEL_III_IRB_FOUNDATION: "basel3",
+            Approach.BASEL_III_IRB_ADVANCED: "basel3",
         }[self]
 
     @property
@@ -84,6 +95,9 @@ class Approach(str, Enum):
         return {
             Approach.BASEL_II_STANDARDIZED: "standardized",
             Approach.BASEL_II_IRB: "irb",
+
             Approach.BASEL_III_STANDARDIZED: "standardized",
-            Approach.BASEL_III_IRB: "irb",
+
+            Approach.BASEL_III_IRB_FOUNDATION: "irb",
+            Approach.BASEL_III_IRB_ADVANCED: "irb",
         }[self]
