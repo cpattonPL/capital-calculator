@@ -5,7 +5,7 @@ import numpy as np
 from calculators.common import compute_ead, format_currency
 from calculators.loans import calculate_loan_capital
 from calculators.securitizations import calculate_securitization_capital
-from calculators.constants import RatingBucket
+from calculators.constants import ExposureType, RatingBucket
 
 st.set_page_config(page_title="Capital Calculator", layout="wide")
 
@@ -102,24 +102,18 @@ if exposure_choice == "Loans":
     # NEW: standardized exposure type (Basel asset class)
     exposure_type = st.selectbox(
         "Exposure Type (Standardized asset class)",
-        [
-            "Corporate",
-            "Retail",
-            "Residential Mortgage",
-            "Commercial Real Estate",
-            "Sovereign / Central Bank",
-            "Bank",
-            "Other",
-        ],
+        options=list(ExposureType),
+        format_func=lambda et: et.label,
     )
+
 
     # NEW: rating bucket used by standardized approach (if relevant)
     rating_bucket = st.selectbox(
         "External rating bucket (if applicable)",
         options=list(RatingBucket),
         format_func=lambda rb: rb.label,
-        help="Used for rating-based risk weights (sovereigns, banks, corporates).",
     )
+
 
     # NEW: flags that influence standardized mapping
     is_regulatory_retail = st.checkbox(

@@ -1,33 +1,34 @@
 # calculators/loans.py
 """
-Loan calculation module (enum-backed rating buckets).
+Loan calculation module (enum-backed exposure types + rating buckets).
 
-Replace existing calculators/loans.py with this file.
+Paste this entire file over calculators/loans.py.
 
 Features:
-- Uses calculators.constants.RatingBucket for all rating-bucket comparisons.
-- Backwards-compatible: accepts rating_bucket as RatingBucket or str (will coerce).
+- Uses calculators.constants.ExposureType and RatingBucket in calculations.
+- Backwards-compatible: accepts exposure_type and rating_bucket as enums OR legacy strings.
 - Implements:
   - Basel III Standardized (Corporates + Banks, simplified SCRA mapping)
-  - Basel II Standardized (unchanged simplified mapping, ported to enums)
-  - IRB Foundation (shared ASRF engine for Corporate/Bank/Sovereign) with PD floors
-- Utilities: rate normalization, rating coercion helpers.
+  - Basel II Standardized (simplified mapping)
+  - IRB Foundation (Basel II F-IRB prototype) for Corporate/Bank/Sovereign
+- Utilities: normalize rates, coerce enums from legacy strings.
 
 Dependencies:
 - scipy
-- calculators.constants.RatingBucket
+- calculators.constants (ExposureType, RatingBucket)
 """
 
 import math
 from typing import Optional, Union
+
 from scipy.stats import norm
 
-from calculators.constants import RatingBucket
+from calculators.constants import ExposureType, RatingBucket
 
-# Basel IRB scaling factor (Basel II IRB default)
+# Basel II IRB scaling factor (kept as-is for current prototype)
 SCALING_FACTOR_IRB = 1.06
 
-# PD floors used in current IRB prototype (defaults; jurisdiction may differ)
+# PD floors used in the current IRB prototype (kept as-is for now)
 PD_FLOORS = {
     "corporate": 0.0003,   # 0.03%
     "bank": 0.0005,        # 0.05%
@@ -47,7 +48,7 @@ def calculate_loan_capital(
     interest_rate: float,
     pd: float,
     lgd: float,
-    exposure_type: str,
+    exposure_type: Union[ExposureType, str, None],
     rating_bucket: Union[RatingBucket, str, None],
     is_regulatory_retail: bool = False,
     is_prudent_mortgage: bool = False,
@@ -56,14 +57,13 @@ def calculate_loan_capital(
     """
     Main entrypoint for loan capital.
 
-    - approach: text label (e.g., "Basel III - Standardized", "Basel II - IRB")
-    - rating_bucket: can be RatingBucket enum, or legacy string (will be coerced when possible)
+    exposure_type: ExposureType enum (preferred) or legacy string (coerced)
+    rating_bucket: RatingBucket enum (preferred) or legacy string (coerced)
     """
     approach_lower = (approach or "").lower()
-    exposure_type_lower = (exposure_type or "").lower()
 
-    # Coerce rating bucket to enum if possible (otherwise None)
-    rb_enum = _coerce_rating_bucket(rating_bucket)
+    et_enum = _coerce_exposure_type(exposure_type)  # may be None
+    rb_enum = _coerce_rating_bucket(rating_bucket)  # may be None
 
     # ========================================================
     # STANDARDIZED APPROACHES
@@ -72,20 +72,18 @@ def calculate_loan_capital(
         # IMPORTANT: check Basel III before Basel II because "basel iii" contains "basel ii" as substring
         if "basel iii" in approach_lower:
             rw = get_standardized_risk_weight_basel3(
-                exposure_type=exposure_type,
+                exposure_type=et_enum,
                 rating_bucket=rb_enum,
             )
             version = "Basel III"
-
         elif "basel ii" in approach_lower:
             rw = get_standardized_risk_weight_basel2(
-                exposure_type=exposure_type,
+                exposure_type=et_enum,
                 rating_bucket=rb_enum,
                 is_regulatory_retail=is_regulatory_retail,
                 is_prudent_mortgage=is_prudent_mortgage,
             )
             version = "Basel II"
-
         else:
             rw = 1.0
             version = "Unknown"
@@ -96,7 +94,7 @@ def calculate_loan_capital(
         return {
             "approach": approach,
             "version": version,
-            "exposure_type": exposure_type,
+            "exposure_type_enum": (et_enum.name if et_enum else None),
             "rating_bucket_enum": (rb_enum.name if rb_enum else None),
             "risk_weight": rw,
             "risk_weight_pct": f"{rw * 100:.2f}%",
@@ -111,7 +109,8 @@ def calculate_loan_capital(
     # IRB APPROACHES (Basel II F-IRB prototype)
     # ========================================================
     if "irb" in approach_lower:
-        if "corporate" in exposure_type_lower:
+        # route by exposure type enum
+        if et_enum == ExposureType.CORPORATE:
             return _calculate_irb_foundation_asrf(
                 asset_class_key="corporate",
                 asset_class_label="Foundation IRB - Corporate",
@@ -123,7 +122,7 @@ def calculate_loan_capital(
                 approach=approach,
             )
 
-        if "bank" in exposure_type_lower:
+        if et_enum == ExposureType.BANK:
             return _calculate_irb_foundation_asrf(
                 asset_class_key="bank",
                 asset_class_label="Foundation IRB - Bank",
@@ -135,7 +134,7 @@ def calculate_loan_capital(
                 approach=approach,
             )
 
-        if "sovereign" in exposure_type_lower or "central bank" in exposure_type_lower:
+        if et_enum == ExposureType.SOVEREIGN_CENTRAL_BANK:
             return _calculate_irb_foundation_asrf(
                 asset_class_key="sovereign",
                 asset_class_label="Foundation IRB - Sovereign/Central Bank",
@@ -147,6 +146,7 @@ def calculate_loan_capital(
                 approach=approach,
             )
 
+        # Non-covered IRB asset classes: keep stub until implemented
         return _calculate_irb_stub(
             approach=approach,
             ead=ead,
@@ -163,7 +163,7 @@ def calculate_loan_capital(
 # BASEL III STANDARDIZED — CORPORATES & BANKS (SCRA simplified)
 # ============================================================
 def get_standardized_risk_weight_basel3(
-    exposure_type: str,
+    exposure_type: Optional[ExposureType],
     rating_bucket: Optional[RatingBucket],
 ) -> float:
     """
@@ -172,33 +172,19 @@ def get_standardized_risk_weight_basel3(
     Implemented:
       - Corporate exposures (SCRA mapping)
       - Bank exposures (SCRA mapping)
-
-    Uses RatingBucket enum for comparisons (safer).
     """
-    exposure_type = (exposure_type or "").lower()
-
-    # -------------------------
-    # Corporate SCRA mapping (simplified)
-    # -------------------------
-    if "corporate" in exposure_type:
-        # Investment-grade set: AAA_AA, A, BBB
-        if rating_bucket in {
-            RatingBucket.AAA_AA,
-            RatingBucket.A,
-            RatingBucket.BBB,
-        }:
+    # Corporate SCRA
+    if exposure_type == ExposureType.CORPORATE:
+        if rating_bucket in {RatingBucket.AAA_AA, RatingBucket.A, RatingBucket.BBB}:
             return 0.75
         if rating_bucket == RatingBucket.BB_B:
             return 1.00
         if rating_bucket == RatingBucket.BELOW_B:
             return 1.50
-        # Unrated or unknown maps to 100%
-        return 1.00
+        return 1.00  # unrated/unknown fallback
 
-    # -------------------------
-    # Bank SCRA mapping (simplified)
-    # -------------------------
-    if "bank" in exposure_type:
+    # Bank SCRA (simplified)
+    if exposure_type == ExposureType.BANK:
         if rating_bucket == RatingBucket.AAA_AA:
             return 0.20
         if rating_bucket == RatingBucket.A:
@@ -209,28 +195,25 @@ def get_standardized_risk_weight_basel3(
             return 1.00
         if rating_bucket == RatingBucket.BELOW_B:
             return 1.50
-        return 1.00
+        return 1.00  # unrated/unknown fallback
 
-    # Other exposure classes not yet implemented under Basel III standardized:
+    # Not implemented yet for other exposure types
     return 1.00
 
 
 # ============================================================
-# BASEL II STANDARDIZED (UNCHANGED, but enum-aware)
+# BASEL II STANDARDIZED (simplified, enum-aware)
 # ============================================================
 def get_standardized_risk_weight_basel2(
-    exposure_type: str,
+    exposure_type: Optional[ExposureType],
     rating_bucket: Optional[RatingBucket],
     is_regulatory_retail: bool,
     is_prudent_mortgage: bool,
 ) -> float:
     """
-    Simplified Basel II standardized mapping, ported to use enums when available.
+    Simplified Basel II standardized mapping, enum-aware.
     """
-    exposure_type = (exposure_type or "").lower()
-
-    # Corporate mapping (Basel II-style)
-    if "corporate" in exposure_type:
+    if exposure_type == ExposureType.CORPORATE:
         if rating_bucket == RatingBucket.AAA_AA:
             return 0.20
         if rating_bucket == RatingBucket.A:
@@ -241,15 +224,15 @@ def get_standardized_risk_weight_basel2(
             return 1.00
         if rating_bucket == RatingBucket.BELOW_B:
             return 1.50
-        # unrated fallback:
         return 1.00
 
-    if "retail" in exposure_type:
+    if exposure_type == ExposureType.RETAIL:
         return 0.75 if is_regulatory_retail else 1.00
 
-    if "residential" in exposure_type:
+    if exposure_type == ExposureType.RESIDENTIAL_MORTGAGE:
         return 0.35 if is_prudent_mortgage else 1.00
 
+    # CRE and other exposure types remain simplified as 100% for now
     return 1.00
 
 
@@ -269,9 +252,9 @@ def _calculate_irb_foundation_asrf(
     """
     Shared ASRF implementation for Foundation IRB (Corporate/Bank/Sovereign).
 
-    - Applies PD floors by asset_class_key
-    - Uses normalization helpers for PD/LGD
-    - Uses measured maturity (floor 1y cap 5y; fallback 2.5y)
+    - Applies PD floors by asset class key
+    - Normalizes PD/LGD (accepts decimals or percentages)
+    - Uses measured maturity with floor/cap (1–5 years; fallback 2.5y)
     - Applies IRB scaling factor (1.06)
     """
     pd_in = _normalize_rate(pd, default=0.01)
@@ -281,24 +264,25 @@ def _calculate_irb_foundation_asrf(
     pd_used = max(pd_in, pd_floor)
 
     if maturity_months and maturity_months > 0:
-        M = min(5.0, max(1.0, maturity_months / 12.0))
+        M = min(5.0, max(1.0, float(maturity_months) / 12.0))
     else:
         M = 2.5
 
-    exp_term = math.exp(-50 * pd_used)
-    denom = 1 - math.exp(-50)
+    exp_term = math.exp(-50.0 * pd_used)
+    denom = 1.0 - math.exp(-50.0)
     denom = denom if denom != 0 else 1e-12
-    R = 0.12 * (1 - exp_term) / denom + 0.24 * (1 - (1 - exp_term) / denom)
+
+    R = 0.12 * (1.0 - exp_term) / denom + 0.24 * (1.0 - (1.0 - exp_term) / denom)
 
     b = (0.11852 - 0.05478 * math.log(max(pd_used, 1e-9))) ** 2
 
     term = (
-        norm.ppf(pd_used) / math.sqrt(1 - R)
-        + math.sqrt(R / (1 - R)) * norm.ppf(0.999)
+        norm.ppf(pd_used) / math.sqrt(1.0 - R)
+        + math.sqrt(R / (1.0 - R)) * norm.ppf(0.999)
     )
 
     K = lgd_in * norm.cdf(term) - pd_used * lgd_in
-    maturity_adj = (1 + (M - 2.5) * b) / (1 - 1.5 * b)
+    maturity_adj = (1.0 + (M - 2.5) * b) / (1.0 - 1.5 * b)
     K_adj = K * maturity_adj
 
     rwa = 12.5 * SCALING_FACTOR_IRB * K_adj * ead
@@ -347,11 +331,6 @@ def _normalize_rate(x, default: float) -> float:
     Normalize a rate possibly supplied as:
       - decimal (0.01)
       - percent (1 meaning 1%, or 45 meaning 45%)
-
-    Rules:
-      - if x is None or <= 0: return default
-      - if x > 1: treat as percent and divide by 100
-      - else: treat as decimal
     """
     if x is None:
         return float(default)
@@ -368,43 +347,74 @@ def _normalize_rate(x, default: float) -> float:
 
 def _coerce_rating_bucket(rb: Union[RatingBucket, str, None]) -> Optional[RatingBucket]:
     """
-    Coerce a rating-bucket input (enum or legacy string) to RatingBucket enum.
-
-    Accepts:
-      - RatingBucket members (returned unchanged)
-      - Human-readable labels (e.g. "AAA to AA-") -> coerced to enum
-      - Enum-like underscores (e.g. "AAA_AA") -> coerced
-      - None -> returns None
-
-    If no match is found, returns None (caller will use unrated fallback).
+    Coerce RatingBucket enum from enum or legacy strings.
     """
     if rb is None:
         return None
     if isinstance(rb, RatingBucket):
         return rb
-    try:
-        # if user supplied the enum name (e.g., "AAA_AA")
-        if isinstance(rb, str):
-            rb_str = rb.strip()
-            # direct enum name match
-            try:
-                return RatingBucket(rb_str)
-            except ValueError:
-                pass
-            # match common UI labels
-            label_map = {
-                "AAA to AA-": RatingBucket.AAA_AA,
-                "A+ to A-": RatingBucket.A,
-                "BBB+ to BBB-": RatingBucket.BBB,
-                "BB+ to B-": RatingBucket.BB_B,
-                "Below B-": RatingBucket.BELOW_B,
-                "Unrated": RatingBucket.UNRATED,
-                "unrated": RatingBucket.UNRATED,
-            }
-            # case-insensitive match by normalized label
-            for k, v in label_map.items():
-                if rb_str.lower() == k.lower():
-                    return v
-    except Exception:
-        pass
+
+    if isinstance(rb, str):
+        s = rb.strip()
+
+        # allow enum value strings (e.g., "AAA_AA") or labels
+        value_map = {e.value: e for e in RatingBucket}
+        label_map = {e.label.lower(): e for e in RatingBucket}
+
+        if s in value_map:
+            return value_map[s]
+        if s.lower() in label_map:
+            return label_map[s.lower()]
+
+        # common legacy variants
+        legacy_map = {
+            "aaa to aa-": RatingBucket.AAA_AA,
+            "a+ to a-": RatingBucket.A,
+            "bbb+ to bbb-": RatingBucket.BBB,
+            "bb+ to b-": RatingBucket.BB_B,
+            "below b-": RatingBucket.BELOW_B,
+            "unrated": RatingBucket.UNRATED,
+        }
+        if s.lower() in legacy_map:
+            return legacy_map[s.lower()]
+
+    return None
+
+
+def _coerce_exposure_type(et: Union[ExposureType, str, None]) -> Optional[ExposureType]:
+    """
+    Coerce ExposureType enum from enum or legacy strings.
+    """
+    if et is None:
+        return None
+    if isinstance(et, ExposureType):
+        return et
+
+    if isinstance(et, str):
+        s = et.strip()
+
+        value_map = {e.value: e for e in ExposureType}
+        label_map = {e.label.lower(): e for e in ExposureType}
+
+        if s in value_map:
+            return value_map[s]
+        if s.lower() in label_map:
+            return label_map[s.lower()]
+
+        # common legacy variants
+        legacy_map = {
+            "corporate": ExposureType.CORPORATE,
+            "retail": ExposureType.RETAIL,
+            "residential mortgage": ExposureType.RESIDENTIAL_MORTGAGE,
+            "commercial real estate": ExposureType.COMMERCIAL_REAL_ESTATE,
+            "sovereign / central bank": ExposureType.SOVEREIGN_CENTRAL_BANK,
+            "sovereign/central bank": ExposureType.SOVEREIGN_CENTRAL_BANK,
+            "sovereign": ExposureType.SOVEREIGN_CENTRAL_BANK,
+            "central bank": ExposureType.SOVEREIGN_CENTRAL_BANK,
+            "bank": ExposureType.BANK,
+            "other": ExposureType.OTHER,
+        }
+        if s.lower() in legacy_map:
+            return legacy_map[s.lower()]
+
     return None

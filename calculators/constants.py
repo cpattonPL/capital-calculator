@@ -5,7 +5,6 @@ class RatingBucket(str, Enum):
     """
     Canonical rating buckets used across UI and calculations.
     Values are stable internal identifiers.
-    Labels are handled in the UI.
     """
 
     AAA_AA = "AAA_AA"
@@ -17,9 +16,6 @@ class RatingBucket(str, Enum):
 
     @property
     def label(self) -> str:
-        """
-        Human-readable label for UI display.
-        """
         return {
             RatingBucket.AAA_AA: "AAA to AA-",
             RatingBucket.A: "A+ to A-",
@@ -27,4 +23,30 @@ class RatingBucket(str, Enum):
             RatingBucket.BB_B: "BB+ to B-",
             RatingBucket.BELOW_B: "Below B-",
             RatingBucket.UNRATED: "Unrated",
+        }[self]
+
+
+class ExposureType(str, Enum):
+    """
+    Canonical exposure types used across UI and calculations.
+    """
+
+    CORPORATE = "CORPORATE"
+    RETAIL = "RETAIL"
+    RESIDENTIAL_MORTGAGE = "RESIDENTIAL_MORTGAGE"
+    COMMERCIAL_REAL_ESTATE = "COMMERCIAL_REAL_ESTATE"
+    SOVEREIGN_CENTRAL_BANK = "SOVEREIGN_CENTRAL_BANK"
+    BANK = "BANK"
+    OTHER = "OTHER"
+
+    @property
+    def label(self) -> str:
+        return {
+            ExposureType.CORPORATE: "Corporate",
+            ExposureType.RETAIL: "Retail",
+            ExposureType.RESIDENTIAL_MORTGAGE: "Residential Mortgage",
+            ExposureType.COMMERCIAL_REAL_ESTATE: "Commercial Real Estate",
+            ExposureType.SOVEREIGN_CENTRAL_BANK: "Sovereign / Central Bank",
+            ExposureType.BANK: "Bank",
+            ExposureType.OTHER: "Other",
         }[self]
