@@ -33,6 +33,15 @@ COLLATERAL_OPTIONS = [
 ]
 
 
+def default_revenue_threshold(jurisdiction: str) -> float:
+    j = (jurisdiction or "US").upper()
+    if j == "CAN":
+        return 750_000_000.0
+    if j == "EU":
+        return 500_000_000.0
+    return 500_000_000.0  # US default baseline
+
+
 with st.sidebar:
     st.header("Approach & Exposure")
 
@@ -64,9 +73,9 @@ with st.sidebar:
 
     jurisdiction = st.selectbox(
         "Jurisdiction",
-        options=["US", "CAN"],
+        options=["US", "CAN", "EU"],
         index=0,
-        help="CAN applies OSFI/Basel III-final input floors. US default applies none; BCBS baseline can be optionally enabled.",
+        help="CAN applies OSFI/Basel III-final input floors. US default applies none; BCBS baseline can be optionally enabled. EU default uses €500m large corporate threshold.",
     )
 
     apply_bcbs_baseline_floors = st.checkbox(
@@ -159,7 +168,7 @@ with col3:
         help="Decimal form (0.45 = 45%). For Basel III IRB Advanced, treated as bank-estimated LGD and may be floored depending on jurisdiction/settings.",
     )
 
-# Collateral type is ALWAYS a loan input (for future EAD/mitigation + for A-IRB floors when enabled)
+# Collateral type is ALWAYS a loan input
 st.subheader("Credit Risk Mitigation Inputs (future EAD/mitigation, and A-IRB floors when enabled)")
 c1, c2 = st.columns([2, 3])
 
@@ -191,6 +200,38 @@ ead = balance
 st.caption(
     f"Derived Balance: **{_currency(balance)}** | Derived EAD (prototype): **{_currency(ead)}**"
 )
+
+# A-IRB applicability inputs: Corporate revenue threshold
+st.subheader("A-IRB applicability (Large corporate revenue threshold)")
+
+show_rev_inputs = (exposure_type == ExposureType.CORPORATE)
+rev1, rev2 = st.columns(2)
+
+with rev1:
+    annual_revenue = st.number_input(
+        "Annual Revenue (consolidated)",
+        min_value=0.0,
+        value=0.0,
+        step=10_000_000.0,
+        format="%.2f",
+        disabled=not show_rev_inputs,
+        help="Used only to determine A-IRB applicability for large corporates. Set to 0 if unknown/unused.",
+    )
+
+with rev2:
+    rev_default = default_revenue_threshold(jurisdiction)
+    revenue_threshold = st.number_input(
+        "Revenue Threshold (editable by jurisdiction)",
+        min_value=0.0,
+        value=float(rev_default),
+        step=10_000_000.0,
+        format="%.2f",
+        disabled=not show_rev_inputs,
+        help="Default: EU €500m, US $500m (modeled), CAN $750m (OSFI). Used to auto-switch A-IRB to F-IRB when exceeded.",
+    )
+
+if not show_rev_inputs:
+    st.info("Revenue threshold inputs apply to Corporate exposures.")
 
 # Basel II standardized toggles (kept)
 st.subheader("Additional Flags (mainly Basel II Standardized)")
@@ -266,13 +307,31 @@ if st.button("Run Calculation", type="primary"):
         capital_ratio=float(capital_ratio),
         jurisdiction=jurisdiction,
         apply_bcbs_baseline_floors=bool(apply_bcbs_baseline_floors),
-        collateral_type=collateral_type,  # ALWAYS passed
+        collateral_type=collateral_type,
+        annual_revenue=float(annual_revenue) if annual_revenue is not None else None,
+        revenue_threshold=float(revenue_threshold) if revenue_threshold is not None else None,
         property_value=property_value,
         property_income_dependent=bool(property_income_dependent),
         counterparty_type=counterparty_type,
     )
 
     st.subheader("Results")
+
+    # If not applicable, show the reason prominently and still show payload
+    if result.get("status") == "not_applicable":
+        st.error(result.get("reason", "Not applicable"))
+        st.info(f"Suggested: {result.get('suggested_approach_label')}")
+        st.subheader("Full result payload")
+        st.json(result)
+        st.stop()
+
+    # Background switch banner
+    bg = result.get("background_switch")
+    if isinstance(bg, dict) and bg.get("enabled"):
+        st.warning(
+            f"Background switch applied: {bg.get('from_approach_label')} → {bg.get('to_approach_label')} "
+            f"(Annual revenue {bg.get('annual_revenue'):,.0f} > threshold {bg.get('revenue_threshold_used'):,.0f})"
+        )
 
     key_cols = st.columns(5)
     with key_cols[0]:
@@ -287,9 +346,9 @@ if st.button("Run Calculation", type="primary"):
         if "capital_required" in result:
             st.metric("Capital Required", _currency(result["capital_required"]))
     with key_cols[3]:
-        st.metric("Jurisdiction", result.get("jurisdiction", jurisdiction))
+        st.metric("Requested", result.get("requested_approach_label", ""))
     with key_cols[4]:
-        st.metric("Floor Regime", result.get("floor_regime", "N/A"))
+        st.metric("Effective", result.get("effective_approach_label", ""))
 
     # CRE details section
     if "cre_details" in result and isinstance(result["cre_details"], dict):
@@ -319,14 +378,12 @@ if st.button("Run Calculation", type="primary"):
     # LGD + PD details (IRB)
     if "lgd_note" in result or "pd_note" in result:
         st.subheader("LGD / PD details (IRB)")
-
         l1, l2 = st.columns(2)
         with l1:
             st.write("**PD input / used**")
             st.write({"pd_input": result.get("pd_input"), "pd_used": result.get("pd_used"), "pd_floor": result.get("pd_floor")})
             st.write("**PD note**")
             st.write(result.get("pd_note"))
-
         with l2:
             st.write("**Collateral type (loan input)**")
             st.write(result.get("collateral_type"))
@@ -348,6 +405,5 @@ if st.button("Run Calculation", type="primary"):
         st.subheader("Basel III Output Floor details")
         st.json(result["output_floor"])
 
-    # Full result payload
     st.subheader("Full result payload")
     st.json(result)
