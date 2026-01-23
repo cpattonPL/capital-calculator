@@ -11,6 +11,8 @@ Includes:
     * A-IRB not applicable for Bank asset class (Option B: return 'not applicable')
     * A-IRB not applicable for large corporates above revenue threshold -> auto-switch to F-IRB with clear flag
 - Collateral type captured as a standard loan input (used for A-IRB LGD floors when enabled; later for CRM/EAD)
+- Phase 1 EAD/CCF plumbing:
+    * caller passes EAD plus optional ead_details dict for audit; we include it in results as EAD_details
 """
 
 import math
@@ -37,11 +39,6 @@ BASEL3_OUTPUT_FLOOR_PCT = 0.725
 # Basel/OSFI PD floor: 0.05% for all exposures except sovereign asset class
 PD_FLOOR_BASEL3_GENERAL = 0.0005  # 0.05%
 
-# Retail PD minimums (not fully wired into IRB retail classes yet)
-PD_FLOOR_RETAIL_OTHER = 0.0005         # 0.05%
-PD_FLOOR_RETAIL_QRRE_REVOLVER = 0.0010  # 0.10%
-
-
 # Basel/OSFI LGD floors (wholesale)
 LGD_FLOORS_BASEL_WHOLESALE = {
     "unsecured": 0.25,  # 25%
@@ -51,19 +48,6 @@ LGD_FLOORS_BASEL_WHOLESALE = {
         "real_estate": 0.10,      # commercial or residential real estate
         "other_physical": 0.15,
         "intangibles": 0.25,
-    },
-}
-
-# Retail floors (not yet wired into IRB retail segmentation)
-LGD_FLOORS_BASEL_RETAIL = {
-    "qrre": 0.50,
-    "residential_mortgage": 0.10,
-    "other_retail_unsecured": 0.30,
-    "other_retail_secured_by_collateral_type": {
-        "financial": 0.00,
-        "receivables": 0.10,
-        "real_estate": 0.10,
-        "other_physical": 0.15,
     },
 }
 
@@ -86,9 +70,8 @@ DEFAULT_LARGE_CORPORATE_REVENUE_THRESHOLD = {
     "CAN": 750_000_000.0,
 }
 
-
 # ----------------------------
-# Supervisory LGD defaults for F-IRB (prototype defaults)
+# Supervisory LGD defaults
 # ----------------------------
 LGD_DEFAULTS_BASEL2_FIRB = {
     "corporate": 0.45,
@@ -126,6 +109,8 @@ def calculate_loan_capital(
     apply_bcbs_baseline_floors: bool = False,  # for US/non-adopting jurisdictions
     # Collateral typing (always accepted; used for A-IRB floors now, and later EAD/mitigation)
     collateral_type: Optional[str] = None,     # "financial", "receivables", "real_estate", "other_physical", "intangibles", or None
+    # Phase 1: EAD/CCF audit details (optional)
+    ead_details: Optional[Dict[str, Any]] = None,
     # A-IRB applicability (large corporate constraint)
     annual_revenue: Optional[float] = None,
     revenue_threshold: Optional[float] = None,
@@ -168,7 +153,7 @@ def calculate_loan_capital(
     collateral_type_norm = _normalize_collateral_type(collateral_type)
 
     # ----------------------------
-    # Step 1/3: Pre-calc A-IRB applicability enforcement (cleanly before computing)
+    # Pre-calc A-IRB applicability enforcement (cleanly before computing)
     # ----------------------------
     background_switch: Optional[Dict[str, Any]] = None
 
@@ -185,6 +170,8 @@ def calculate_loan_capital(
             "exposure_type_enum": et_enum.name if et_enum else None,
             "rating_bucket_enum": rb_enum.name if rb_enum else None,
             "collateral_type": collateral_type_norm,
+            "EAD": ead,
+            "EAD_details": ead_details,
             "reason": "Basel III A-IRB is not applicable for exposures in the bank asset class. Use Basel III IRB (Foundation) instead.",
             "suggested_approach": Approach.BASEL_III_IRB_FOUNDATION.name,
             "suggested_approach_label": Approach.BASEL_III_IRB_FOUNDATION.label,
@@ -218,7 +205,7 @@ def calculate_loan_capital(
                 "jurisdiction": jurisdiction_norm,
             }
 
-    # From here onward, we compute using the effective approach (possibly switched)
+    # From here onward, compute using the effective approach (possibly switched)
     approach_enum = effective_approach_enum
 
     # =========================
@@ -266,10 +253,14 @@ def calculate_loan_capital(
 
             "risk_weight": rw,
             "risk_weight_pct": f"{rw * 100:.2f}%",
+
             "EAD": ead,
+            "EAD_details": ead_details,
+
             "property_value": property_value,
             "LTV": (ead / property_value if property_value and property_value > 0 else None),
             "property_income_dependent": property_income_dependent,
+
             "RWA": rwa,
             "capital_ratio": capital_ratio,
             "capital_required": capital_required,
@@ -297,14 +288,7 @@ def calculate_loan_capital(
             asset_class_key = "sovereign"
             asset_class_label = "IRB - Sovereign/Central Bank"
         else:
-            stub = _calculate_irb_stub(
-                approach_enum=approach_enum,
-                ead=ead,
-                maturity_months=maturity_months,
-                pd=pd,
-                lgd=lgd,
-                capital_ratio=capital_ratio,
-            )
+            stub = _calculate_irb_stub(approach_enum=approach_enum)
             stub.update({
                 "status": "stub",
                 "requested_approach": requested_approach_enum.name,
@@ -317,6 +301,8 @@ def calculate_loan_capital(
                 "collateral_type": collateral_type_norm,
                 "annual_revenue": annual_revenue,
                 "revenue_threshold": revenue_threshold,
+                "EAD": ead,
+                "EAD_details": ead_details,
             })
             return stub
 
@@ -332,8 +318,6 @@ def calculate_loan_capital(
 
             if approach_enum == Approach.BASEL_III_IRB_ADVANCED:
                 irb_mode = "Basel III IRB - Advanced"
-
-                # Note: bank exposure class AIRB is handled earlier as "not applicable" (Option B)
                 lgd_mode = "bank_estimated"
                 lgd_defaults = LGD_DEFAULTS_BASEL3_FIRB
                 lgd_floor_policy = _get_basel3_lgd_floor_policy(
@@ -341,7 +325,6 @@ def calculate_loan_capital(
                     asset_class_key=asset_class_key,
                     collateral_type=collateral_type_norm,
                 )
-
             else:
                 irb_mode = "Basel III IRB - Foundation"
                 lgd_mode = "supervisory"
@@ -355,7 +338,7 @@ def calculate_loan_capital(
                 }
 
         else:
-            # Basel II IRB Foundation (existing prototype behavior)
+            # Basel II IRB Foundation (prototype)
             scaling_factor = SCALING_FACTOR_BASEL2_IRB
             irb_mode = "Basel II IRB - Foundation"
             pd_floors = {
@@ -393,7 +376,7 @@ def calculate_loan_capital(
             collateral_type=collateral_type_norm,
         )
 
-        # Add top-level metadata + background switch info
+        # Add top-level metadata + background switch info + EAD details
         irb_result.update({
             "status": "ok",
             "requested_approach": requested_approach_enum.name,
@@ -403,6 +386,7 @@ def calculate_loan_capital(
             "background_switch": background_switch,
             "annual_revenue": annual_revenue,
             "revenue_threshold": revenue_threshold,
+            "EAD_details": ead_details,
         })
 
         if not apply_output_floor:
@@ -707,6 +691,7 @@ def _calculate_irb_asrf(
         pd_used = max(pd_in, pd_floor)
         pd_note = f"PD used = max(PD input {pd_in:.6f}, PD floor {pd_floor:.6f})"
 
+    # M based on maturity term (months); enforce [1, 5]
     if maturity_months and maturity_months > 0:
         M = min(5.0, max(1.0, float(maturity_months) / 12.0))
     else:
@@ -743,11 +728,13 @@ def _calculate_irb_asrf(
             lgd_rule_path = lgd_floor_policy.get("rule_path") or "No LGD floor applied"
             lgd_note = f"Bank-estimated LGD used: {lgd_used:.4f} (no floor applied)"
 
+    # Correlation (prototype corporate/bank form)
     exp_term = math.exp(-50.0 * max(pd_used, 1e-12))
     denom = 1.0 - math.exp(-50.0)
     denom = denom if denom != 0 else 1e-12
     R = 0.12 * (1.0 - exp_term) / denom + 0.24 * (1.0 - (1.0 - exp_term) / denom)
 
+    # Maturity adjustment b (prototype)
     b = (0.11852 - 0.05478 * math.log(max(pd_used, 1e-9))) ** 2
 
     term = (
@@ -802,14 +789,7 @@ def _calculate_irb_asrf(
     }
 
 
-def _calculate_irb_stub(
-    approach_enum: Approach,
-    ead: float,
-    maturity_months: int,
-    pd: float,
-    lgd: float,
-    capital_ratio: float,
-) -> Dict[str, Any]:
+def _calculate_irb_stub(*, approach_enum: Approach) -> Dict[str, Any]:
     return {
         "approach_enum": approach_enum.name,
         "approach_label": approach_enum.label,
@@ -840,8 +820,8 @@ def _normalize_collateral_type(collateral_type: Optional[str]) -> Optional[str]:
     s = str(collateral_type).strip().lower()
     if s in ("", "none", "unsecured", "n/a"):
         return None
-    allowed = {"financial", "receivables", "real_estate", "other_physical", "intangibles"}
-    return s if s in allowed else s  # keep unknown strings for audit
+    # keep unknown strings for audit; enforce known ones for the secured-floor lookup
+    return s
 
 
 def _coerce_rating_bucket(rb: Union[RatingBucket, str, None]) -> Optional[RatingBucket]:
@@ -857,6 +837,8 @@ def _coerce_rating_bucket(rb: Union[RatingBucket, str, None]) -> Optional[Rating
             return value_map[s]
         if s.lower() in label_map:
             return label_map[s.lower()]
+
+        # legacy bucket text mapping (defensive)
         legacy_map = {
             "aaa to aa-": RatingBucket.AAA_AA,
             "a+ to a-": RatingBucket.A,
@@ -883,6 +865,7 @@ def _coerce_exposure_type(et: Union[ExposureType, str, None]) -> Optional[Exposu
             return value_map[s]
         if s.lower() in label_map:
             return label_map[s.lower()]
+
         legacy_map = {
             "corporate": ExposureType.CORPORATE,
             "retail": ExposureType.RETAIL,

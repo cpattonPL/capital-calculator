@@ -1,6 +1,7 @@
 # app.py
 import streamlit as st
 
+from calculators.ead import compute_ead
 from calculators.loans import calculate_loan_capital
 from calculators.constants import Approach, ExposureType, RatingBucket
 
@@ -189,16 +190,43 @@ with c2:
     else:
         st.caption("Collateral type is stored but not currently applied (it will be used later for mitigation/EAD work).")
 
-# Derived balance & EAD (simple prototype)
+# Derived balance & EAD (we now compute EAD using compute_ead)
 if loan_type == "Term":
     balance = commitment
 else:
     balance = commitment * utilization_pct
 
-ead = balance
+# EAD UI: allow an optional override for undrawn CCF (applies to LOC/LC)
+st.subheader("EAD / CCF settings")
+ccf_col1, ccf_col2 = st.columns([2, 1])
+with ccf_col1:
+    use_ccf_override = st.checkbox(
+        "Override undrawn CCF for this run?",
+        value=False,
+        help="If enabled, apply this undrawn CCF to the undrawn portion (useful for testing alternative supervisory CCFs).",
+    )
+with ccf_col2:
+    undrawn_ccf_override = st.number_input(
+        "Undrawn CCF override (0..1)",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.75,
+        step=0.05,
+        format="%.3f",
+        disabled=not use_ccf_override,
+    )
+
+# Compute EAD using the new module
+ead, ead_details = compute_ead(
+    loan_type=loan_type,
+    commitment=commitment,
+    balance=balance,
+    utilization_pct=utilization_pct,
+    undrawn_ccf_override=(undrawn_ccf_override if use_ccf_override else None),
+)
 
 st.caption(
-    f"Derived Balance: **{_currency(balance)}** | Derived EAD (prototype): **{_currency(ead)}**"
+    f"Derived Balance: **{_currency(balance)}** | EAD (calculated): **{_currency(ead)}**"
 )
 
 # A-IRB applicability inputs: Corporate revenue threshold
@@ -308,6 +336,7 @@ if st.button("Run Calculation", type="primary"):
         jurisdiction=jurisdiction,
         apply_bcbs_baseline_floors=bool(apply_bcbs_baseline_floors),
         collateral_type=collateral_type,
+        ead_details=ead_details,
         annual_revenue=float(annual_revenue) if annual_revenue is not None else None,
         revenue_threshold=float(revenue_threshold) if revenue_threshold is not None else None,
         property_value=property_value,
@@ -333,7 +362,7 @@ if st.button("Run Calculation", type="primary"):
             f"(Annual revenue {bg.get('annual_revenue'):,.0f} > threshold {bg.get('revenue_threshold_used'):,.0f})"
         )
 
-    key_cols = st.columns(5)
+    key_cols = st.columns(6)
     with key_cols[0]:
         if "risk_weight_pct" in result:
             st.metric("Risk Weight", result["risk_weight_pct"])
@@ -349,6 +378,12 @@ if st.button("Run Calculation", type="primary"):
         st.metric("Requested", result.get("requested_approach_label", ""))
     with key_cols[4]:
         st.metric("Effective", result.get("effective_approach_label", ""))
+    with key_cols[5]:
+        st.metric("EAD", _currency(result.get("EAD", ead)))
+
+    # EAD details
+    st.subheader("EAD details")
+    st.json(ead_details)
 
     # CRE details section
     if "cre_details" in result and isinstance(result["cre_details"], dict):
